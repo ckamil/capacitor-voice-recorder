@@ -6,6 +6,8 @@ import Capacitor
 public class VoiceRecorder: CAPPlugin {
 
     private var customMediaRecorder: CustomMediaRecorder?
+    private var isInterrupted: Bool = false
+    private var isMicrophoneCurrentlyAvailable: Bool = true
 
     @objc func canDeviceVoiceRecord(_ call: CAPPluginCall) {
         call.resolve(ResponseGenerator.successResponse())
@@ -36,6 +38,9 @@ public class VoiceRecorder: CAPPlugin {
             return
         }
 
+        // Setup audio session interruption handling
+        setupAudioSessionInterruptionHandling()
+
         customMediaRecorder = CustomMediaRecorder()
         if customMediaRecorder == nil {
             call.reject(Messages.CANNOT_RECORD_ON_THIS_PHONE)
@@ -50,6 +55,7 @@ public class VoiceRecorder: CAPPlugin {
             customMediaRecorder = nil
             call.reject(Messages.CANNOT_RECORD_ON_THIS_PHONE)
         } else {
+            isInterrupted = false
             call.resolve(ResponseGenerator.successResponse())
         }
     }
@@ -59,6 +65,9 @@ public class VoiceRecorder: CAPPlugin {
             call.reject(Messages.RECORDING_HAS_NOT_STARTED)
             return
         }
+
+        // Remove audio session interruption observer
+        removeAudioSessionInterruptionHandling()
 
         customMediaRecorder?.stopRecording()
 
@@ -82,6 +91,7 @@ public class VoiceRecorder: CAPPlugin {
             path: sendDataAsBase64 ? nil : path
         )
         customMediaRecorder = nil
+        isInterrupted = false
         if (sendDataAsBase64 && recordData.recordDataBase64 == nil) || recordData.msDuration < 0 {
             call.reject(Messages.EMPTY_RECORDING)
         } else {
@@ -113,6 +123,7 @@ public class VoiceRecorder: CAPPlugin {
         }
     }
 
+
     func doesUserGaveAudioRecordingPermission() -> Bool {
         return AVAudioSession.sharedInstance().recordPermission == AVAudioSession.RecordPermission.granted
     }
@@ -136,6 +147,212 @@ public class VoiceRecorder: CAPPlugin {
             return -1
         }
         return Int(CMTimeGetSeconds(AVURLAsset(url: filePath!).duration) * 1000)
+    }
+
+
+    // MARK: - Audio Session Interruption Handling
+
+    private func setupAudioSessionInterruptionHandling() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioSessionInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance()
+        )
+    }
+
+    private func removeAudioSessionInterruptionHandling() {
+        NotificationCenter.default.removeObserver(
+            self,
+            name: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance()
+        )
+    }
+
+    @objc private func handleAudioSessionInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSessionInterruptionType(rawValue: typeValue) else {
+            NSLog("VoiceRecorder: Invalid interruption notification")
+            return
+        }
+
+        NSLog("VoiceRecorder: Audio session interruption type: %d (isInterrupted: %@)", typeValue, isInterrupted ? "true" : "false")
+
+        switch type {
+        case .began:
+            // Recording was interrupted
+            NSLog("VoiceRecorder: Interruption began")
+            handleRecordingInterruption()
+
+        case .ended:
+            // Interruption ended
+            NSLog("VoiceRecorder: Interruption ended")
+            handleInterruptionEnded(userInfo)
+
+        @unknown default:
+            NSLog("VoiceRecorder: Unknown interruption type: %d", typeValue)
+            break
+        }
+    }
+
+    private func handleRecordingInterruption() {
+        NSLog("VoiceRecorder: handleRecordingInterruption called - customMediaRecorder: %@", customMediaRecorder != nil ? "exists" : "nil")
+
+        // Handle recording interruption if we have an active recording
+        if customMediaRecorder != nil {
+            isInterrupted = true
+
+            // Pause recording if it's active
+            let currentStatus = customMediaRecorder?.getCurrentStatus()
+            if currentStatus == CurrentRecordingStatus.RECORDING {
+                let _ = customMediaRecorder?.pauseRecording()
+            }
+
+            // Notify JavaScript layer about the recording interruption
+            let interruptionData = [
+                "data": [
+                    "reason": "system_interruption",
+                    "timestamp": ISO8601DateFormatter().string(from: Date())
+                ]
+            ]
+
+            NSLog("VoiceRecorder: Sending recordingInterrupted event to JavaScript - reason: system_interruption")
+            notifyListeners("recordingInterrupted", data: interruptionData)
+        }
+
+        // Always handle global microphone availability (only when not recording to avoid duplication)
+        if customMediaRecorder == nil && isMicrophoneCurrentlyAvailable {
+            isMicrophoneCurrentlyAvailable = false
+            
+            let availabilityData: [String: Any] = [
+                "available": false,
+                "reason": "other_app_started"
+            ]
+
+            NSLog("VoiceRecorder: Sending microphoneAvailabilityChanged: false - other_app_started")
+            notifyListeners("microphoneAvailabilityChanged", data: availabilityData)
+        }
+    }
+
+    private func handleInterruptionEnded(_ userInfo: [AnyHashable: Any]) {
+        NSLog("VoiceRecorder: handleInterruptionEnded called - isInterrupted: %@, customMediaRecorder: %@",
+              isInterrupted ? "true" : "false",
+              customMediaRecorder != nil ? "exists" : "nil")
+
+        // Handle recording resumption if we have an interrupted recording
+        if isInterrupted && customMediaRecorder != nil {
+            // Check if we should resume recording
+            var canResume = false
+            if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
+                let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+                canResume = options.contains(.shouldResume)
+            }
+
+            // Notify JavaScript layer that interruption ended
+            let interruptionEndedData = [
+                "canResume": canResume
+            ]
+
+            NSLog("VoiceRecorder: Sending interruptionEnded event to JavaScript - canResume: %@", canResume ? "true" : "false")
+            notifyListeners("interruptionEnded", data: interruptionEndedData)
+
+            // Auto-resume if system suggests it and recording is still paused
+            if canResume && customMediaRecorder != nil {
+                let currentStatus = customMediaRecorder?.getCurrentStatus()
+                if currentStatus == CurrentRecordingStatus.PAUSED {
+                    let _ = customMediaRecorder?.resumeRecording()
+                }
+            }
+
+            isInterrupted = false
+        }
+
+        // Always handle global microphone availability (only when not recording to avoid duplication)
+        if customMediaRecorder == nil && !isMicrophoneCurrentlyAvailable {
+            isMicrophoneCurrentlyAvailable = true
+            
+            let availabilityData: [String: Any] = [
+                "available": true,
+                "reason": "other_app_finished"
+            ]
+
+            NSLog("VoiceRecorder: Sending microphoneAvailabilityChanged: true - other_app_finished")
+            notifyListeners("microphoneAvailabilityChanged", data: availabilityData)
+        }
+    }
+
+    // MARK: - Plugin Lifecycle
+
+    public override func load() {
+        super.load()
+        setupGlobalAudioSessionListener()
+    }
+
+    deinit {
+        removeGlobalAudioSessionListener()
+    }
+
+    // MARK: - Global Audio Session Monitoring
+
+    private func setupGlobalAudioSessionListener() {
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleGlobalAudioSessionInterruption(_:)),
+            name: AVAudioSession.interruptionNotification,
+            object: nil
+        )
+        
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioSessionRouteChange(_:)),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
+    }
+
+    private func removeGlobalAudioSessionListener() {
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.routeChangeNotification, object: nil)
+    }
+
+    @objc private func handleGlobalAudioSessionInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSessionInterruptionType(rawValue: typeValue) else {
+            return
+        }
+
+        switch type {
+        case .began:
+            handleRecordingInterruption() // Now handles both recording and global availability
+            
+        case .ended:
+            handleInterruptionEnded(userInfo) // Now handles both recording and global availability
+            
+        @unknown default:
+            break
+        }
+    }
+
+    @objc private func handleAudioSessionRouteChange(_ notification: Notification) {
+        // Monitor route changes to detect when other apps start/stop using audio
+        let audioSession = AVAudioSession.sharedInstance()
+        let wasAvailable = isMicrophoneCurrentlyAvailable
+        let isNowAvailable = !audioSession.isOtherAudioPlaying
+        
+        if wasAvailable != isNowAvailable && customMediaRecorder == nil {
+            isMicrophoneCurrentlyAvailable = isNowAvailable
+            
+            let reason = isNowAvailable ? "other_app_finished" : "other_app_started"
+            let availabilityData: [String: Any] = [
+                "available": isNowAvailable,
+                "reason": reason
+            ]
+
+            NSLog("VoiceRecorder: Route change - microphoneAvailabilityChanged: %@ - %@", isNowAvailable ? "true" : "false", reason)
+            notifyListeners("microphoneAvailabilityChanged", data: availabilityData)
+        }
     }
 
 }

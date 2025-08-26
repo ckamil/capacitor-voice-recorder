@@ -3,7 +3,7 @@
 </p>
 <h3 align="center">Capacitor Voice Recorder</h3>
 <p align="center"><strong><code>tchvu3/capacitor-voice-recorder</code></strong></p>
-<p align="center">Capacitor plugin for simple voice recording</p>
+<p align="center">Capacitor plugin for voice recording with interruption handling</p>
 
 <p align="center">
   <img src="https://img.shields.io/maintenance/yes/2025" />
@@ -222,6 +222,150 @@ VoiceRecorder.getCurrentStatus()
 | `NONE`      | Plugin is idle and waiting to start a new recording. |
 | `RECORDING` | Plugin is currently recording.                       |
 | `PAUSED`    | Recording is paused.                                 |
+
+## 🎯 Interruption Handling (Enhanced)
+
+This fork includes enhanced interruption handling for iOS and Android, addressing common issues where recordings are lost due to phone calls, app backgrounding, or other system interruptions.
+
+### New Event Listeners
+
+#### recordingInterrupted
+
+Listen for recording interruption events (phone calls, other apps taking audio focus):
+
+```typescript
+import { VoiceRecorder, RecordingInterruptionEvent } from 'capacitor-voice-recorder';
+
+VoiceRecorder.addListener('recordingInterrupted', (event: RecordingInterruptionEvent) => {
+  console.log('Recording interrupted:', event.data.reason);
+  // Reasons: 'system_interruption', 'audio_focus_loss', 'phone_call', 'other_app'
+  
+  // Handle interruption - show UI, save state, etc.
+  showRecordingPausedDialog();
+});
+```
+
+#### interruptionEnded
+
+Listen for interruption end events (recording can potentially be resumed):
+
+```typescript
+import { VoiceRecorder, InterruptionEndedEvent } from 'capacitor-voice-recorder';
+
+VoiceRecorder.addListener('interruptionEnded', (event: InterruptionEndedEvent) => {
+  console.log('Interruption ended, can resume:', event.canResume);
+  
+  if (event.canResume) {
+    // Show option to resume recording
+    showResumeRecordingDialog();
+  } else {
+    // Cannot resume, inform user
+    showRecordingStoppedDialog();
+  }
+});
+```
+
+### Platform-Specific Behavior
+
+#### iOS
+- Uses `AVAudioSessionInterruptionNotification` for native interruption handling
+- Automatically pauses recording on phone calls, Siri activation, etc.
+- Provides option to resume when interruption ends
+- Handles app backgrounding gracefully
+
+#### Android
+- Uses `AudioManager.OnAudioFocusChangeListener` for audio focus management
+- Supports `AudioFocusRequest` for modern Android versions (API 26+)
+- Handles different types of audio focus loss:
+  - `AUDIOFOCUS_LOSS`: Permanent loss (phone call)
+  - `AUDIOFOCUS_LOSS_TRANSIENT`: Temporary loss
+  - `AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK`: Brief interruption
+
+### Interruption Data Types
+
+```typescript
+interface InterruptionData {
+  reason: 'system_interruption' | 'audio_focus_loss' | 'phone_call' | 'other_app';
+  timestamp: string;
+}
+
+interface RecordingInterruptionEvent {
+  data: InterruptionData;
+}
+
+interface InterruptionEndedEvent {
+  canResume: boolean;
+}
+```
+
+### Usage Example with Error Recovery
+
+```typescript
+import { VoiceRecorder } from 'capacitor-voice-recorder';
+
+class RecordingManager {
+  private isRecordingInterrupted = false;
+
+  async startRecording() {
+    // Setup listeners before starting
+    this.setupInterruptionHandlers();
+    
+    await VoiceRecorder.startRecording();
+  }
+
+  private setupInterruptionHandlers() {
+    VoiceRecorder.addListener('recordingInterrupted', (event) => {
+      this.isRecordingInterrupted = true;
+      
+      // Show user-friendly message
+      this.showInterruptionAlert(event.data.reason);
+    });
+
+    VoiceRecorder.addListener('interruptionEnded', (event) => {
+      if (this.isRecordingInterrupted && event.canResume) {
+        this.showResumeOption();
+      } else {
+        this.handleRecordingLost();
+      }
+    });
+  }
+
+  private showInterruptionAlert(reason: string) {
+    let message = 'Recording paused';
+    switch (reason) {
+      case 'system_interruption':
+        message = 'Recording paused due to system interruption';
+        break;
+      case 'phone_call':
+        message = 'Recording paused due to incoming call';
+        break;
+      case 'audio_focus_loss':
+        message = 'Another app took control of audio';
+        break;
+    }
+    // Show alert to user
+  }
+
+  private async resumeRecording() {
+    try {
+      await VoiceRecorder.resumeRecording();
+      this.isRecordingInterrupted = false;
+    } catch (error) {
+      console.error('Failed to resume recording:', error);
+      this.handleRecordingLost();
+    }
+  }
+}
+```
+
+### Benefits
+
+✅ **Prevents lost recordings** due to phone calls and system interruptions  
+✅ **User awareness** of recording state changes  
+✅ **Graceful recovery** with resume options  
+✅ **Platform-native** interruption handling  
+✅ **Backward compatible** - existing code continues to work  
+✅ **Enhanced UX** with proper user notifications
 
 ## Format and Mime type
 

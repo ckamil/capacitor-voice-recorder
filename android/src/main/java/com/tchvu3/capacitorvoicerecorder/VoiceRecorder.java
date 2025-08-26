@@ -3,8 +3,10 @@ package com.tchvu3.capacitorvoicerecorder;
 import android.Manifest;
 import android.content.Context;
 import android.media.AudioManager;
+import android.media.AudioFocusRequest;
 import android.media.MediaPlayer;
 import android.net.Uri;
+import android.os.Build;
 import android.util.Base64;
 import com.getcapacitor.PermissionState;
 import com.getcapacitor.Plugin;
@@ -13,6 +15,7 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
+import com.getcapacitor.JSObject;
 import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
@@ -26,6 +29,12 @@ public class VoiceRecorder extends Plugin {
 
     static final String RECORD_AUDIO_ALIAS = "voice recording";
     private CustomMediaRecorder mediaRecorder;
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
+    private boolean isInterrupted = false;
+    private AudioManager globalAudioManager;
+    private AudioFocusRequest globalAudioFocusRequest;
+    private boolean isMicrophoneCurrentlyAvailable = true;
 
     @PluginMethod
     public void canDeviceVoiceRecord(PluginCall call) {
@@ -78,14 +87,19 @@ public class VoiceRecorder extends Plugin {
         }
 
         try {
+            // Setup audio focus handling
+            setupAudioFocusHandling();
+
             String directory = call.getString("directory");
             String subDirectory = call.getString("subDirectory");
             RecordOptions options = new RecordOptions(directory, subDirectory);
             mediaRecorder = new CustomMediaRecorder(getContext(), options);
             mediaRecorder.startRecording();
+            isInterrupted = false;
             call.resolve(ResponseGenerator.successResponse());
         } catch (Exception exp) {
             mediaRecorder = null;
+            releaseAudioFocus();
             call.reject(Messages.FAILED_TO_RECORD, exp);
         }
     }
@@ -133,6 +147,8 @@ public class VoiceRecorder extends Plugin {
             }
 
             mediaRecorder = null;
+            releaseAudioFocus();
+            isInterrupted = false;
         }
     }
 
@@ -203,5 +219,192 @@ public class VoiceRecorder extends Plugin {
         AudioManager audioManager = (AudioManager) this.getContext().getSystemService(Context.AUDIO_SERVICE);
         if (audioManager == null) return true;
         return audioManager.getMode() != AudioManager.MODE_NORMAL;
+    }
+
+    // Audio Focus Handling Methods
+    private void setupAudioFocusHandling() {
+        audioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+        if (audioManager == null) return;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+                .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                .build();
+            audioManager.requestAudioFocus(audioFocusRequest);
+        } else {
+            audioManager.requestAudioFocus(
+                audioFocusChangeListener,
+                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+            );
+        }
+    }
+
+    private void releaseAudioFocus() {
+        if (audioManager == null) return;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(audioFocusRequest);
+                audioFocusRequest = null;
+            }
+        } else {
+            audioManager.abandonAudioFocus(audioFocusChangeListener);
+        }
+        audioManager = null;
+    }
+
+    private final AudioManager.OnAudioFocusChangeListener audioFocusChangeListener =
+        new AudioManager.OnAudioFocusChangeListener() {
+        @Override
+        public void onAudioFocusChange(int focusChange) {
+            android.util.Log.d("VoiceRecorder", "onAudioFocusChange: " + focusChange + " (isInterrupted: " + isInterrupted + ", recording: " + (mediaRecorder != null) + ")");
+
+            // Handle recording interruption if we have an active recording
+            if (mediaRecorder != null) {
+                switch (focusChange) {
+                    case AudioManager.AUDIOFOCUS_LOSS:
+                    case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                        handleAudioFocusLoss(false);
+                        break;
+                    case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                        handleAudioFocusLoss(true);
+                        break;
+                    case AudioManager.AUDIOFOCUS_GAIN:
+                        handleAudioFocusGain();
+                        break;
+                }
+            }
+        }
+    };
+
+    private void handleAudioFocusLoss(boolean canDuck) {
+        android.util.Log.d("VoiceRecorder", "handleAudioFocusLoss called - canDuck: " + canDuck + ", mediaRecorder: " + (mediaRecorder != null));
+
+        // Handle recording interruption if we have an active recording
+        if (mediaRecorder != null) {
+            isInterrupted = true;
+
+            // Pause recording when we lose audio focus
+            CurrentRecordingStatus currentStatus = mediaRecorder.getCurrentStatus();
+            if (currentStatus == CurrentRecordingStatus.RECORDING) {
+                try {
+                    mediaRecorder.pauseRecording();
+                } catch (NotSupportedOsVersion ignored) {
+                    // If pause is not supported, we can't handle interruption gracefully
+                    return;
+                }
+            }
+
+            // Notify JavaScript layer about the recording interruption
+            JSObject interruptionData = new JSObject();
+            JSObject data = new JSObject();
+            data.put("reason", canDuck ? "other_app" : "audio_focus_loss");
+            data.put("timestamp", java.time.Instant.now().toString());
+            interruptionData.put("data", data);
+
+            android.util.Log.d("VoiceRecorder", "Sending recordingInterrupted event to JavaScript - reason: " + data.getString("reason"));
+            notifyListeners("recordingInterrupted", interruptionData);
+        }
+
+        // Always handle global microphone availability (only when not recording to avoid duplication)
+        if (mediaRecorder == null && isMicrophoneCurrentlyAvailable) {
+            isMicrophoneCurrentlyAvailable = false;
+
+            String reason = isMicrophoneOccupied() ? "phone_call_started" : "other_app_started";
+            JSObject availabilityData = new JSObject();
+            availabilityData.put("available", false);
+            availabilityData.put("reason", reason);
+
+            android.util.Log.d("VoiceRecorder", "Sending microphoneAvailabilityChanged: false - " + reason);
+            notifyListeners("microphoneAvailabilityChanged", availabilityData);
+        }
+    }
+
+    private void handleAudioFocusGain() {
+        android.util.Log.d("VoiceRecorder", "handleAudioFocusGain called - isInterrupted: " + isInterrupted + ", mediaRecorder: " + (mediaRecorder != null));
+
+        // Handle recording resumption if we have an interrupted recording
+        if (isInterrupted && mediaRecorder != null) {
+            // Notify JavaScript layer that interruption ended
+            JSObject interruptionEndedData = new JSObject();
+            interruptionEndedData.put("canResume", true);
+
+            android.util.Log.d("VoiceRecorder", "Sending interruptionEnded event to JavaScript");
+            notifyListeners("interruptionEnded", interruptionEndedData);
+
+            // Auto-resume if recording is paused
+            CurrentRecordingStatus currentStatus = mediaRecorder.getCurrentStatus();
+            if (currentStatus == CurrentRecordingStatus.PAUSED) {
+                try {
+                    mediaRecorder.resumeRecording();
+                    isInterrupted = false;
+                } catch (NotSupportedOsVersion ignored) {
+                    // If resume is not supported, keep interruption state
+                }
+            }
+        }
+
+        // Always handle global microphone availability (only when not recording to avoid duplication)
+        if (mediaRecorder == null && !isMicrophoneCurrentlyAvailable) {
+            isMicrophoneCurrentlyAvailable = true;
+
+            JSObject availabilityData = new JSObject();
+            availabilityData.put("available", true);
+            availabilityData.put("reason", "other_app_finished");
+
+            android.util.Log.d("VoiceRecorder", "Sending microphoneAvailabilityChanged: true - other_app_finished");
+            notifyListeners("microphoneAvailabilityChanged", availabilityData);
+        }
+    }
+
+
+    @Override
+    public void load() {
+        super.load();
+        setupGlobalAudioFocusListener();
+    }
+
+    @Override
+    public void handleOnDestroy() {
+        releaseGlobalAudioFocusListener();
+        super.handleOnDestroy();
+    }
+
+    // Global Audio Focus Listener for Microphone Availability Detection
+
+    private void setupGlobalAudioFocusListener() {
+        globalAudioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+        if (globalAudioManager == null) return;
+
+        // Use the same listener as for recording - it handles both cases now
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            globalAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
+                .setOnAudioFocusChangeListener(audioFocusChangeListener)
+                .build();
+            globalAudioManager.requestAudioFocus(globalAudioFocusRequest);
+            globalAudioManager.abandonAudioFocusRequest(globalAudioFocusRequest); // Just to register listener
+        } else {
+            globalAudioManager.requestAudioFocus(
+                audioFocusChangeListener,
+                AudioManager.STREAM_VOICE_CALL,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            );
+            globalAudioManager.abandonAudioFocus(audioFocusChangeListener); // Just to register listener
+        }
+    }
+
+    private void releaseGlobalAudioFocusListener() {
+        if (globalAudioManager == null) return;
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            if (globalAudioFocusRequest != null) {
+                globalAudioManager.abandonAudioFocusRequest(globalAudioFocusRequest);
+                globalAudioFocusRequest = null;
+            }
+        } else {
+            globalAudioManager.abandonAudioFocus(audioFocusChangeListener);
+        }
+        globalAudioManager = null;
     }
 }
