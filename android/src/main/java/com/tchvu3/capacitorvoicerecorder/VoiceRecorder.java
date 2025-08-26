@@ -32,6 +32,7 @@ public class VoiceRecorder extends Plugin {
     private AudioManager audioManager;
     private AudioFocusRequest audioFocusRequest;
     private boolean isInterrupted = false;
+    private boolean wasInterruptedAndStopped = false; // Tracks if we stopped recording due to interruption
     private AudioManager globalAudioManager;
     private AudioFocusRequest globalAudioFocusRequest;
     private boolean isMicrophoneCurrentlyAvailable = true;
@@ -96,6 +97,7 @@ public class VoiceRecorder extends Plugin {
             mediaRecorder = new CustomMediaRecorder(getContext(), options);
             mediaRecorder.startRecording();
             isInterrupted = false;
+            wasInterruptedAndStopped = false;
             call.resolve(ResponseGenerator.successResponse());
         } catch (Exception exp) {
             mediaRecorder = null;
@@ -148,6 +150,11 @@ public class VoiceRecorder extends Plugin {
 
             mediaRecorder = null;
             releaseAudioFocus();
+            
+            // If we were interrupted, mark that we stopped due to interruption
+            if (isInterrupted) {
+                wasInterruptedAndStopped = true;
+            }
             isInterrupted = false;
         }
     }
@@ -312,7 +319,8 @@ public class VoiceRecorder extends Plugin {
         android.util.Log.d("VoiceRecorder", "handleAudioFocusGain called - isInterrupted: " + isInterrupted + ", mediaRecorder: " + (mediaRecorder != null));
 
         // Handle recording resumption if we have an interrupted recording
-        if (isInterrupted && mediaRecorder != null) {
+        // Note: mediaRecorder might be null if recording was stopped after interruption
+        if (isInterrupted || wasInterruptedAndStopped) {
             // Notify JavaScript layer that interruption ended
             JSObject interruptionEndedData = new JSObject();
             interruptionEndedData.put("canResume", true);
@@ -320,16 +328,9 @@ public class VoiceRecorder extends Plugin {
             android.util.Log.d("VoiceRecorder", "Sending interruptionEnded event to JavaScript");
             notifyListeners("interruptionEnded", interruptionEndedData);
 
-            // Auto-resume if recording is paused
-            CurrentRecordingStatus currentStatus = mediaRecorder.getCurrentStatus();
-            if (currentStatus == CurrentRecordingStatus.PAUSED) {
-                try {
-                    mediaRecorder.resumeRecording();
-                    isInterrupted = false;
-                } catch (NotSupportedOsVersion ignored) {
-                    // If resume is not supported, keep interruption state
-                }
-            }
+            // Reset interruption state
+            isInterrupted = false;
+            wasInterruptedAndStopped = false;
         }
     }
 
@@ -417,7 +418,22 @@ public class VoiceRecorder extends Plugin {
                         break;
 
                     case AudioManager.AUDIOFOCUS_GAIN:
-                        // Only send event if microphone was unavailable and we're not the cause
+                        // Check if we have an interrupted recording that needs to be notified
+                        if (isInterrupted || wasInterruptedAndStopped) {
+                            android.util.Log.d("VoiceRecorder", "Global listener detected AUDIOFOCUS_GAIN with interrupted recording");
+                            
+                            // Notify JavaScript layer that interruption ended
+                            JSObject interruptionEndedData = new JSObject();
+                            interruptionEndedData.put("canResume", true);
+
+                            android.util.Log.d("VoiceRecorder", "Global - Sending interruptionEnded event to JavaScript");
+                            notifyListeners("interruptionEnded", interruptionEndedData);
+
+                            isInterrupted = false;
+                            wasInterruptedAndStopped = false;
+                        }
+                        
+                        // Only send availability event if microphone was unavailable and we're not the cause
                         if (!isMicrophoneCurrentlyAvailable && !isOurAppCausingFocusChange()) {
                             isMicrophoneCurrentlyAvailable = true;
 

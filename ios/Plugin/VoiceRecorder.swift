@@ -7,6 +7,7 @@ public class VoiceRecorder: CAPPlugin {
 
     private var customMediaRecorder: CustomMediaRecorder?
     private var isInterrupted: Bool = false
+    private var wasInterruptedAndStopped: Bool = false // Tracks if we stopped recording due to interruption
     private var isMicrophoneCurrentlyAvailable: Bool = true
 
     @objc func canDeviceVoiceRecord(_ call: CAPPluginCall) {
@@ -56,6 +57,7 @@ public class VoiceRecorder: CAPPlugin {
             call.reject(Messages.CANNOT_RECORD_ON_THIS_PHONE)
         } else {
             isInterrupted = false
+            wasInterruptedAndStopped = false
             call.resolve(ResponseGenerator.successResponse())
         }
     }
@@ -90,6 +92,12 @@ public class VoiceRecorder: CAPPlugin {
             msDuration: getMsDurationOfAudioFile(audioFileUrl),
             path: sendDataAsBase64 ? nil : path
         )
+        
+        // If we were interrupted, mark that we stopped due to interruption
+        if isInterrupted {
+            wasInterruptedAndStopped = true
+        }
+        
         customMediaRecorder = nil
         isInterrupted = false
         if (sendDataAsBase64 && recordData.recordDataBase64 == nil) || recordData.msDuration < 0 {
@@ -241,7 +249,8 @@ public class VoiceRecorder: CAPPlugin {
               customMediaRecorder != nil ? "exists" : "nil")
 
         // Handle recording resumption if we have an interrupted recording
-        if isInterrupted && customMediaRecorder != nil {
+        // Note: customMediaRecorder might be nil if recording was stopped after interruption
+        if isInterrupted || wasInterruptedAndStopped {
             // Check if we should resume recording
             var canResume = false
             if let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt {
@@ -257,15 +266,9 @@ public class VoiceRecorder: CAPPlugin {
             NSLog("VoiceRecorder: Sending interruptionEnded event to JavaScript - canResume: %@", canResume ? "true" : "false")
             notifyListeners("interruptionEnded", data: interruptionEndedData)
 
-            // Auto-resume if system suggests it and recording is still paused
-            if canResume && customMediaRecorder != nil {
-                let currentStatus = customMediaRecorder?.getCurrentStatus()
-                if currentStatus == CurrentRecordingStatus.PAUSED {
-                    let _ = customMediaRecorder?.resumeRecording()
-                }
-            }
-
+            // Don't auto-resume - let JavaScript layer decide
             isInterrupted = false
+            wasInterruptedAndStopped = false
         }
 
         // Handle global microphone availability only when not recording and not caused by our app
@@ -330,6 +333,21 @@ public class VoiceRecorder: CAPPlugin {
                 handleRecordingInterruption() // Now handles both recording and global availability
                 
             case .ended:
+                // Check if we have an interrupted recording that the main handler might have missed
+                if isInterrupted || wasInterruptedAndStopped {
+                    NSLog("VoiceRecorder: Global listener detected interruption ended with active interrupted recording")
+                    
+                    let interruptionEndedData = [
+                        "canResume": true
+                    ]
+
+                    NSLog("VoiceRecorder: Global - Sending interruptionEnded event to JavaScript")
+                    notifyListeners("interruptionEnded", data: interruptionEndedData)
+
+                    isInterrupted = false
+                    wasInterruptedAndStopped = false
+                }
+                
                 handleInterruptionEnded(userInfo) // Now handles both recording and global availability
                 
             @unknown default:
