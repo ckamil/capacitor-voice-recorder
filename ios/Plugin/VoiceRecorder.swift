@@ -180,7 +180,7 @@ public class VoiceRecorder: CAPPlugin {
     @objc private func handleAudioSessionInterruption(_ notification: Notification) {
         guard let userInfo = notification.userInfo,
               let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSessionInterruptionType(rawValue: typeValue) else {
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
             NSLog("VoiceRecorder: Invalid interruption notification")
             return
         }
@@ -211,12 +211,6 @@ public class VoiceRecorder: CAPPlugin {
         if customMediaRecorder != nil {
             isInterrupted = true
 
-            // Pause recording if it's active
-            let currentStatus = customMediaRecorder?.getCurrentStatus()
-            if currentStatus == CurrentRecordingStatus.RECORDING {
-                let _ = customMediaRecorder?.pauseRecording()
-            }
-
             // Notify JavaScript layer about the recording interruption
             let interruptionData = [
                 "data": [
@@ -229,13 +223,15 @@ public class VoiceRecorder: CAPPlugin {
             notifyListeners("recordingInterrupted", data: interruptionData)
         }
 
-        // Handle global microphone availability only when not recording and not caused by our app
-        if customMediaRecorder == nil && isMicrophoneCurrentlyAvailable && !isOurAppCausingInterruption() {
+        // Handle global microphone availability changes
+        if isMicrophoneCurrentlyAvailable {
             isMicrophoneCurrentlyAvailable = false
             
             let availabilityData: [String: Any] = [
                 "available": false,
-                "reason": "other_app_started"
+                "reason": "other_app_started",
+                "ourAppRecording": customMediaRecorder != nil,
+                "otherAppActive": true
             ]
 
             NSLog("VoiceRecorder: Sending microphoneAvailabilityChanged: false - other_app_started")
@@ -271,13 +267,15 @@ public class VoiceRecorder: CAPPlugin {
             wasInterruptedAndStopped = false
         }
 
-        // Handle global microphone availability only when not recording and not caused by our app
-        if customMediaRecorder == nil && !isMicrophoneCurrentlyAvailable && !isOurAppCausingInterruption() {
+        // Handle global microphone availability changes
+        if !isMicrophoneCurrentlyAvailable {
             isMicrophoneCurrentlyAvailable = true
             
             let availabilityData: [String: Any] = [
                 "available": true,
-                "reason": "other_app_finished"
+                "reason": "other_app_finished",
+                "ourAppRecording": customMediaRecorder != nil,
+                "otherAppActive": false
             ]
 
             NSLog("VoiceRecorder: Sending microphoneAvailabilityChanged: true - other_app_finished")
@@ -322,7 +320,7 @@ public class VoiceRecorder: CAPPlugin {
     @objc private func handleGlobalAudioSessionInterruption(_ notification: Notification) {
         guard let userInfo = notification.userInfo,
               let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
-              let type = AVAudioSessionInterruptionType(rawValue: typeValue) else {
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
             return
         }
 
@@ -362,13 +360,15 @@ public class VoiceRecorder: CAPPlugin {
         let wasAvailable = isMicrophoneCurrentlyAvailable
         let isNowAvailable = !audioSession.isOtherAudioPlaying
         
-        if wasAvailable != isNowAvailable && (customMediaRecorder == nil || isInterrupted) && !isOurAppCausingInterruption() {
+        if wasAvailable != isNowAvailable {
             isMicrophoneCurrentlyAvailable = isNowAvailable
             
             let reason = isNowAvailable ? "other_app_finished" : "other_app_started"
             let availabilityData: [String: Any] = [
                 "available": isNowAvailable,
-                "reason": reason
+                "reason": reason,
+                "ourAppRecording": customMediaRecorder != nil,
+                "otherAppActive": !isNowAvailable
             ]
 
             NSLog("VoiceRecorder: Route change - microphoneAvailabilityChanged: %@ - %@", isNowAvailable ? "true" : "false", reason)

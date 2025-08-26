@@ -40,18 +40,33 @@ class CustomMediaRecorder {
     }
 
     func startRecording(recordOptions: RecordOptions) -> Bool {
+        NSLog("CustomMediaRecorder: startRecording called")
+        
         do {
             options = recordOptions
             recordingSession = AVAudioSession.sharedInstance()
+            
+            NSLog("CustomMediaRecorder: Current audio session category: %@", recordingSession.category.rawValue)
+            NSLog("CustomMediaRecorder: Audio session active: %@", recordingSession.isOtherAudioPlaying ? "false" : "true")
+            
             originalRecordingSessionCategory = recordingSession.category
             try recordingSession.setCategory(AVAudioSession.Category.playAndRecord)
             try recordingSession.setActive(true)
+            
+            NSLog("CustomMediaRecorder: Audio session configured successfully")
+            
             audioFilePath = getDirectoryToSaveAudioFile().appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
             audioRecorder = try AVAudioRecorder(url: audioFilePath, settings: settings)
+            
+            NSLog("CustomMediaRecorder: AudioRecorder created, calling record()")
+            
             audioRecorder.record()
             status = CurrentRecordingStatus.RECORDING
+            
+            NSLog("CustomMediaRecorder: Recording started successfully")
             return true
-        } catch {
+        } catch let error {
+            NSLog("CustomMediaRecorder: Error in startRecording: %@", error.localizedDescription)
             return false
         }
     }
