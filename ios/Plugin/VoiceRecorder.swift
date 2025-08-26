@@ -221,8 +221,8 @@ public class VoiceRecorder: CAPPlugin {
             notifyListeners("recordingInterrupted", data: interruptionData)
         }
 
-        // Always handle global microphone availability (only when not recording to avoid duplication)
-        if customMediaRecorder == nil && isMicrophoneCurrentlyAvailable {
+        // Handle global microphone availability only when not recording and not caused by our app
+        if customMediaRecorder == nil && isMicrophoneCurrentlyAvailable && !isOurAppCausingInterruption() {
             isMicrophoneCurrentlyAvailable = false
             
             let availabilityData: [String: Any] = [
@@ -268,8 +268,8 @@ public class VoiceRecorder: CAPPlugin {
             isInterrupted = false
         }
 
-        // Always handle global microphone availability (only when not recording to avoid duplication)
-        if customMediaRecorder == nil && !isMicrophoneCurrentlyAvailable {
+        // Handle global microphone availability only when not recording and not caused by our app
+        if customMediaRecorder == nil && !isMicrophoneCurrentlyAvailable && !isOurAppCausingInterruption() {
             isMicrophoneCurrentlyAvailable = true
             
             let availabilityData: [String: Any] = [
@@ -323,15 +323,18 @@ public class VoiceRecorder: CAPPlugin {
             return
         }
 
-        switch type {
-        case .began:
-            handleRecordingInterruption() // Now handles both recording and global availability
-            
-        case .ended:
-            handleInterruptionEnded(userInfo) // Now handles both recording and global availability
-            
-        @unknown default:
-            break
+        // Only handle global events when not actively recording or when recording is interrupted
+        if customMediaRecorder == nil || isInterrupted {
+            switch type {
+            case .began:
+                handleRecordingInterruption() // Now handles both recording and global availability
+                
+            case .ended:
+                handleInterruptionEnded(userInfo) // Now handles both recording and global availability
+                
+            @unknown default:
+                break
+            }
         }
     }
 
@@ -341,7 +344,7 @@ public class VoiceRecorder: CAPPlugin {
         let wasAvailable = isMicrophoneCurrentlyAvailable
         let isNowAvailable = !audioSession.isOtherAudioPlaying
         
-        if wasAvailable != isNowAvailable && customMediaRecorder == nil {
+        if wasAvailable != isNowAvailable && (customMediaRecorder == nil || isInterrupted) && !isOurAppCausingInterruption() {
             isMicrophoneCurrentlyAvailable = isNowAvailable
             
             let reason = isNowAvailable ? "other_app_finished" : "other_app_started"
@@ -353,6 +356,13 @@ public class VoiceRecorder: CAPPlugin {
             NSLog("VoiceRecorder: Route change - microphoneAvailabilityChanged: %@ - %@", isNowAvailable ? "true" : "false", reason)
             notifyListeners("microphoneAvailabilityChanged", data: availabilityData)
         }
+    }
+
+    // Helper method to determine if our app is causing the interruption
+    private func isOurAppCausingInterruption() -> Bool {
+        // If we have an active recording that's not interrupted, we are using the microphone
+        // If recording is interrupted, we're not actively using the microphone anymore
+        return customMediaRecorder != nil && !isInterrupted
     }
 
 }

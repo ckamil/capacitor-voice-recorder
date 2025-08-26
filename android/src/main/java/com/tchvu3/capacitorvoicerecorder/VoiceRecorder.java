@@ -306,19 +306,6 @@ public class VoiceRecorder extends Plugin {
             android.util.Log.d("VoiceRecorder", "Sending recordingInterrupted event to JavaScript - reason: " + data.getString("reason"));
             notifyListeners("recordingInterrupted", interruptionData);
         }
-
-        // Always handle global microphone availability (only when not recording to avoid duplication)
-        if (mediaRecorder == null && isMicrophoneCurrentlyAvailable) {
-            isMicrophoneCurrentlyAvailable = false;
-
-            String reason = isMicrophoneOccupied() ? "phone_call_started" : "other_app_started";
-            JSObject availabilityData = new JSObject();
-            availabilityData.put("available", false);
-            availabilityData.put("reason", reason);
-
-            android.util.Log.d("VoiceRecorder", "Sending microphoneAvailabilityChanged: false - " + reason);
-            notifyListeners("microphoneAvailabilityChanged", availabilityData);
-        }
     }
 
     private void handleAudioFocusGain() {
@@ -344,18 +331,6 @@ public class VoiceRecorder extends Plugin {
                 }
             }
         }
-
-        // Always handle global microphone availability (only when not recording to avoid duplication)
-        if (mediaRecorder == null && !isMicrophoneCurrentlyAvailable) {
-            isMicrophoneCurrentlyAvailable = true;
-
-            JSObject availabilityData = new JSObject();
-            availabilityData.put("available", true);
-            availabilityData.put("reason", "other_app_finished");
-
-            android.util.Log.d("VoiceRecorder", "Sending microphoneAvailabilityChanged: true - other_app_finished");
-            notifyListeners("microphoneAvailabilityChanged", availabilityData);
-        }
     }
 
 
@@ -377,25 +352,30 @@ public class VoiceRecorder extends Plugin {
         globalAudioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
         if (globalAudioManager == null) return;
 
-        // Use the same listener as for recording - it handles both cases now
+        android.util.Log.d("VoiceRecorder", "Setting up global audio focus listener");
+
+        // Create a separate listener that maintains audio focus to monitor changes
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            globalAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setOnAudioFocusChangeListener(audioFocusChangeListener)
+            globalAudioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setOnAudioFocusChangeListener(globalAudioFocusChangeListener)
+                .setAcceptsDelayedFocusGain(true)
                 .build();
-            globalAudioManager.requestAudioFocus(globalAudioFocusRequest);
-            globalAudioManager.abandonAudioFocusRequest(globalAudioFocusRequest); // Just to register listener
+            int result = globalAudioManager.requestAudioFocus(globalAudioFocusRequest);
+            android.util.Log.d("VoiceRecorder", "Global audio focus request result: " + result);
         } else {
-            globalAudioManager.requestAudioFocus(
-                audioFocusChangeListener,
-                AudioManager.STREAM_VOICE_CALL,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
+            int result = globalAudioManager.requestAudioFocus(
+                globalAudioFocusChangeListener,
+                AudioManager.STREAM_MUSIC,
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
             );
-            globalAudioManager.abandonAudioFocus(audioFocusChangeListener); // Just to register listener
+            android.util.Log.d("VoiceRecorder", "Global audio focus request result: " + result);
         }
     }
 
     private void releaseGlobalAudioFocusListener() {
         if (globalAudioManager == null) return;
+
+        android.util.Log.d("VoiceRecorder", "Releasing global audio focus listener");
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (globalAudioFocusRequest != null) {
@@ -403,8 +383,61 @@ public class VoiceRecorder extends Plugin {
                 globalAudioFocusRequest = null;
             }
         } else {
-            globalAudioManager.abandonAudioFocus(audioFocusChangeListener);
+            globalAudioManager.abandonAudioFocus(globalAudioFocusChangeListener);
         }
         globalAudioManager = null;
+    }
+
+    // Separate global audio focus listener for microphone availability monitoring
+    private final AudioManager.OnAudioFocusChangeListener globalAudioFocusChangeListener =
+        new AudioManager.OnAudioFocusChangeListener() {
+        @Override
+        public void onAudioFocusChange(int focusChange) {
+            android.util.Log.d("VoiceRecorder", "Global onAudioFocusChange: " + focusChange + " (recording: " + (mediaRecorder != null) + ", available: " + isMicrophoneCurrentlyAvailable + ")");
+
+            // Handle microphone availability when not actively recording 
+            // or when recording is interrupted (paused due to other app)
+            if (mediaRecorder == null || isInterrupted) {
+                switch (focusChange) {
+                    case AudioManager.AUDIOFOCUS_LOSS:
+                    case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT:
+                    case AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK:
+                        // Only send event if microphone was available and we're not the cause
+                        if (isMicrophoneCurrentlyAvailable && !isOurAppCausingFocusChange()) {
+                            isMicrophoneCurrentlyAvailable = false;
+
+                            String reason = isMicrophoneOccupied() ? "phone_call_started" : "other_app_started";
+                            JSObject availabilityData = new JSObject();
+                            availabilityData.put("available", false);
+                            availabilityData.put("reason", reason);
+
+                            android.util.Log.d("VoiceRecorder", "Global - Sending microphoneAvailabilityChanged: false - " + reason);
+                            notifyListeners("microphoneAvailabilityChanged", availabilityData);
+                        }
+                        break;
+
+                    case AudioManager.AUDIOFOCUS_GAIN:
+                        // Only send event if microphone was unavailable and we're not the cause
+                        if (!isMicrophoneCurrentlyAvailable && !isOurAppCausingFocusChange()) {
+                            isMicrophoneCurrentlyAvailable = true;
+
+                            JSObject availabilityData = new JSObject();
+                            availabilityData.put("available", true);
+                            availabilityData.put("reason", "other_app_finished");
+
+                            android.util.Log.d("VoiceRecorder", "Global - Sending microphoneAvailabilityChanged: true - other_app_finished");
+                            notifyListeners("microphoneAvailabilityChanged", availabilityData);
+                        }
+                        break;
+                }
+            }
+        }
+    };
+
+    // Helper method to determine if our app is causing the audio focus change
+    private boolean isOurAppCausingFocusChange() {
+        // If we have an active recording that's not interrupted, we are using the microphone
+        // If recording is interrupted, we're not actively using the microphone anymore
+        return mediaRecorder != null && !isInterrupted;
     }
 }
