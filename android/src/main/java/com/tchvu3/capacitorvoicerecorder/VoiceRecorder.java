@@ -68,22 +68,29 @@ public class VoiceRecorder extends Plugin {
     @PluginMethod
     public void startRecording(PluginCall call) {
         if (!CustomMediaRecorder.canPhoneCreateMediaRecorder(getContext())) {
-            call.reject(Messages.CANNOT_RECORD_ON_THIS_PHONE);
+            rejectWithDiagnostics(call, Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                    "Device cannot create MediaRecorder", null);
             return;
         }
 
         if (!doesUserGaveAudioRecordingPermission()) {
-            call.reject(Messages.MISSING_PERMISSION);
+            rejectWithDiagnostics(call, Messages.MISSING_PERMISSION,
+                    "Audio recording permission not granted", null);
             return;
         }
 
         if (this.isMicrophoneOccupied()) {
-            call.reject(Messages.MICROPHONE_BEING_USED);
+            AudioManager audioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+            JSObject details = new JSObject();
+            details.put("audioMode", audioManager != null ? audioManager.getMode() : -1);
+            rejectWithDiagnostics(call, Messages.MICROPHONE_BEING_USED,
+                    "Microphone is occupied by another application", details);
             return;
         }
 
         if (mediaRecorder != null) {
-            call.reject(Messages.ALREADY_RECORDING);
+            rejectWithDiagnostics(call, Messages.ALREADY_RECORDING,
+                    "Recording is already in progress", null);
             return;
         }
 
@@ -102,7 +109,11 @@ public class VoiceRecorder extends Plugin {
         } catch (Exception exp) {
             mediaRecorder = null;
             releaseAudioFocus();
-            call.reject(Messages.FAILED_TO_RECORD, exp);
+            JSObject details = new JSObject();
+            details.put("exceptionType", exp.getClass().getSimpleName());
+            details.put("exceptionMessage", exp.getMessage());
+            rejectWithDiagnostics(call, Messages.FAILED_TO_RECORD,
+                    "Exception during recording setup: " + exp.getMessage(), details);
         }
     }
 
@@ -455,5 +466,30 @@ public class VoiceRecorder extends Plugin {
         // If we have an active recording that's not interrupted, we are using the microphone
         // If recording is interrupted, we're not actively using the microphone anymore
         return mediaRecorder != null && !isInterrupted;
+    }
+
+    // Enhanced error reporting method
+    private void rejectWithDiagnostics(PluginCall call, String baseMessage, String reason, JSObject details) {
+        AudioManager audioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+
+        JSObject diagnosticInfo = new JSObject();
+        diagnosticInfo.put("baseError", baseMessage);
+        diagnosticInfo.put("reason", reason);
+        diagnosticInfo.put("timestamp", java.time.Instant.now().toString());
+        diagnosticInfo.put("platform", "android");
+        diagnosticInfo.put("hasPermission", doesUserGaveAudioRecordingPermission());
+        diagnosticInfo.put("canCreateMediaRecorder", CustomMediaRecorder.canPhoneCreateMediaRecorder(getContext()));
+
+        if (audioManager != null) {
+            diagnosticInfo.put("audioMode", audioManager.getMode());
+            diagnosticInfo.put("isMicrophoneOccupied", isMicrophoneOccupied());
+        }
+
+        if (details != null) {
+            diagnosticInfo.put("details", details);
+        }
+
+        String fullMessage = baseMessage + ": " + reason;
+        call.reject(fullMessage, fullMessage, null, diagnosticInfo);
     }
 }

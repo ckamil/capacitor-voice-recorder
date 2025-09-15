@@ -41,32 +41,71 @@ class CustomMediaRecorder {
 
     func startRecording(recordOptions: RecordOptions) -> Bool {
         NSLog("CustomMediaRecorder: startRecording called")
-        
+
         do {
             options = recordOptions
             recordingSession = AVAudioSession.sharedInstance()
-            
-            NSLog("CustomMediaRecorder: Current audio session category: %@", recordingSession.category.rawValue)
-            NSLog("CustomMediaRecorder: Audio session active: %@", recordingSession.isOtherAudioPlaying ? "false" : "true")
-            
+
+            // Enhanced logging for diagnostics
+            NSLog("CustomMediaRecorder: Audio session state - category: %@, otherAudioPlaying: %@, availableInputs: %d",
+                  recordingSession.category.rawValue,
+                  recordingSession.isOtherAudioPlaying ? "true" : "false",
+                  recordingSession.availableInputs?.count ?? 0)
+
+            if recordingSession.isOtherAudioPlaying {
+                NSLog("CustomMediaRecorder: CANNOT_RECORD - Other audio is playing")
+                return false
+            }
+
+            if recordingSession.availableInputs?.isEmpty == true {
+                NSLog("CustomMediaRecorder: CANNOT_RECORD - No available inputs")
+                return false
+            }
+
             originalRecordingSessionCategory = recordingSession.category
             try recordingSession.setCategory(AVAudioSession.Category.playAndRecord)
             try recordingSession.setActive(true)
-            
-            NSLog("CustomMediaRecorder: Audio session configured successfully")
-            
+
+            NSLog("CustomMediaRecorder: Audio session configured - new category: %@", recordingSession.category.rawValue)
+
             audioFilePath = getDirectoryToSaveAudioFile().appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
+
+            // Check file path accessibility
+            let parentDir = audioFilePath.deletingLastPathComponent()
+            if !FileManager.default.isWritableFile(atPath: parentDir.path) {
+                NSLog("CustomMediaRecorder: CANNOT_RECORD - Cannot write to directory: %@", parentDir.path)
+                return false
+            }
+
             audioRecorder = try AVAudioRecorder(url: audioFilePath, settings: settings)
-            
-            NSLog("CustomMediaRecorder: AudioRecorder created, calling record()")
-            
-            audioRecorder.record()
+
+            if audioRecorder == nil {
+                NSLog("CustomMediaRecorder: CANNOT_RECORD - Failed to create AVAudioRecorder")
+                return false
+            }
+
+            if !audioRecorder.prepareToRecord() {
+                NSLog("CustomMediaRecorder: CANNOT_RECORD - AVAudioRecorder.prepareToRecord failed")
+                return false
+            }
+
+            NSLog("CustomMediaRecorder: AudioRecorder prepared, calling record()")
+
+            let recordResult = audioRecorder.record()
+            if !recordResult {
+                NSLog("CustomMediaRecorder: CANNOT_RECORD - AVAudioRecorder.record() returned false")
+                return false
+            }
+
             status = CurrentRecordingStatus.RECORDING
-            
             NSLog("CustomMediaRecorder: Recording started successfully")
             return true
+
         } catch let error {
-            NSLog("CustomMediaRecorder: Error in startRecording: %@", error.localizedDescription)
+            NSLog("CustomMediaRecorder: CANNOT_RECORD - Exception: %@ (domain: %@, code: %ld)",
+                  error.localizedDescription,
+                  (error as NSError).domain,
+                  (error as NSError).code)
             return false
         }
     }

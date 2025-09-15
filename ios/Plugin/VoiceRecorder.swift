@@ -30,12 +30,46 @@ public class VoiceRecorder: CAPPlugin {
 
     @objc func startRecording(_ call: CAPPluginCall) {
         if !doesUserGaveAudioRecordingPermission() {
-            call.reject(Messages.MISSING_PERMISSION)
+            rejectWithDiagnostics(call,
+                                 Messages.MISSING_PERMISSION,
+                                 "Microphone permission not granted")
             return
         }
 
         if customMediaRecorder != nil {
-            call.reject(Messages.ALREADY_RECORDING)
+            rejectWithDiagnostics(call,
+                                 Messages.ALREADY_RECORDING,
+                                 "Recording is already in progress")
+            return
+        }
+
+        // Check audio session state before creating recorder
+        let audioSession = AVAudioSession.sharedInstance()
+
+        if audioSession.isOtherAudioPlaying {
+            // Try cleanup first if it might be our orphaned session
+            if audioSession.category == .playAndRecord {
+                NSLog("VoiceRecorder: Detected playAndRecord with otherAudioPlaying, attempting cleanup")
+                try? audioSession.setActive(false)
+                try? audioSession.setCategory(.ambient)
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+
+            // Check again after cleanup attempt
+            if audioSession.isOtherAudioPlaying {
+                rejectWithDiagnostics(call,
+                                     Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                                     "Other audio application is active",
+                                     ["otherAudioPlaying": true, "cleanupAttempted": audioSession.category == .playAndRecord])
+                return
+            }
+        }
+
+        if audioSession.availableInputs?.isEmpty == true {
+            rejectWithDiagnostics(call,
+                                 Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                                 "No microphone input available",
+                                 ["availableInputs": 0])
             return
         }
 
@@ -44,7 +78,9 @@ public class VoiceRecorder: CAPPlugin {
 
         customMediaRecorder = CustomMediaRecorder()
         if customMediaRecorder == nil {
-            call.reject(Messages.CANNOT_RECORD_ON_THIS_PHONE)
+            rejectWithDiagnostics(call,
+                                 Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                                 "Failed to initialize CustomMediaRecorder")
             return
         }
 
@@ -54,7 +90,9 @@ public class VoiceRecorder: CAPPlugin {
         let successfullyStartedRecording = customMediaRecorder!.startRecording(recordOptions: recordOptions)
         if successfullyStartedRecording == false {
             customMediaRecorder = nil
-            call.reject(Messages.CANNOT_RECORD_ON_THIS_PHONE)
+            rejectWithDiagnostics(call,
+                                 Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                                 "CustomMediaRecorder.startRecording returned false")
         } else {
             isInterrupted = false
             wasInterruptedAndStopped = false
@@ -287,6 +325,15 @@ public class VoiceRecorder: CAPPlugin {
 
     public override func load() {
         super.load()
+
+        // Simple orphaned session cleanup
+        let audioSession = AVAudioSession.sharedInstance()
+        if audioSession.category == .playAndRecord && customMediaRecorder == nil {
+            NSLog("VoiceRecorder: Detected orphaned audio session, cleaning up")
+            try? audioSession.setActive(false)
+            try? audioSession.setCategory(.ambient)
+        }
+
         setupGlobalAudioSessionListener()
     }
 
@@ -381,6 +428,40 @@ public class VoiceRecorder: CAPPlugin {
         // If we have an active recording that's not interrupted, we are using the microphone
         // If recording is interrupted, we're not actively using the microphone anymore
         return customMediaRecorder != nil && !isInterrupted
+    }
+
+    // MARK: - Enhanced Error Reporting
+
+    private func rejectWithDiagnostics(_ call: CAPPluginCall, _ baseMessage: String, _ reason: String, _ details: [String: Any] = [:]) {
+        let audioSession = AVAudioSession.sharedInstance()
+
+        var diagnosticInfo: [String: Any] = [
+            "baseError": baseMessage,
+            "reason": reason,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "platform": "ios",
+            "audioSessionCategory": audioSession.category.rawValue,
+            "isOtherAudioPlaying": audioSession.isOtherAudioPlaying,
+            "availableInputs": audioSession.availableInputs?.count ?? 0,
+            "hasRecordPermission": doesUserGaveAudioRecordingPermission()
+        ]
+
+        // Add specific details if provided
+        if !details.isEmpty {
+            diagnosticInfo["details"] = details
+        }
+
+        // Add input route information
+        if let availableInputs = audioSession.availableInputs {
+            diagnosticInfo["inputRoutes"] = availableInputs.map { $0.portType.rawValue }
+        }
+
+        let currentRoute = audioSession.currentRoute
+        diagnosticInfo["currentInputs"] = currentRoute.inputs.map { $0.portType.rawValue }
+        diagnosticInfo["currentOutputs"] = currentRoute.outputs.map { $0.portType.rawValue }
+
+        let fullMessage = "\(baseMessage): \(reason)"
+        call.reject(fullMessage, fullMessage, nil, diagnosticInfo)
     }
 
 }

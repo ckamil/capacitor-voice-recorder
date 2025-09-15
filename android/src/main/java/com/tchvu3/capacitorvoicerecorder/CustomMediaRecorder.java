@@ -18,20 +18,37 @@ public class CustomMediaRecorder {
     private CurrentRecordingStatus currentRecordingStatus = CurrentRecordingStatus.NONE;
 
     public CustomMediaRecorder(Context context, RecordOptions options) throws IOException {
+        android.util.Log.d("CustomMediaRecorder", "Constructor called");
         this.context = context;
         this.options = options;
         generateMediaRecorder();
     }
 
     private void generateMediaRecorder() throws IOException {
-        mediaRecorder = new MediaRecorder();
-        mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
-        mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS);
-        mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
-        mediaRecorder.setAudioEncodingBitRate(96000);
-        mediaRecorder.setAudioSamplingRate(44100);
-        setRecorderOutputFile();
-        mediaRecorder.prepare();
+        android.util.Log.d("CustomMediaRecorder", "generateMediaRecorder called");
+
+        try {
+            mediaRecorder = new MediaRecorder();
+            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS);
+            mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+            mediaRecorder.setAudioEncodingBitRate(96000);
+            mediaRecorder.setAudioSamplingRate(44100);
+
+            android.util.Log.d("CustomMediaRecorder", "MediaRecorder configured, setting output file");
+
+            setRecorderOutputFile();
+
+            android.util.Log.d("CustomMediaRecorder", "Output file set, preparing MediaRecorder");
+
+            mediaRecorder.prepare();
+
+            android.util.Log.d("CustomMediaRecorder", "MediaRecorder prepared successfully");
+
+        } catch (IOException e) {
+            android.util.Log.e("CustomMediaRecorder", "CANNOT_RECORD - Failed to generate MediaRecorder: " + e.getMessage());
+            throw e;
+        }
     }
 
     private void setRecorderOutputFile() throws IOException {
@@ -74,9 +91,17 @@ public class CustomMediaRecorder {
         };
     }
 
-    public void startRecording() {
-        mediaRecorder.start();
-        currentRecordingStatus = CurrentRecordingStatus.RECORDING;
+    public void startRecording() throws IOException {
+        android.util.Log.d("CustomMediaRecorder", "startRecording called");
+
+        try {
+            mediaRecorder.start();
+            currentRecordingStatus = CurrentRecordingStatus.RECORDING;
+            android.util.Log.d("CustomMediaRecorder", "Recording started successfully");
+        } catch (Exception e) {
+            android.util.Log.e("CustomMediaRecorder", "CANNOT_RECORD - MediaRecorder.start() failed: " + e.getMessage());
+            throw e;
+        }
     }
 
     public void stopRecording() {
