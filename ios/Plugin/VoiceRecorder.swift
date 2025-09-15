@@ -90,9 +90,16 @@ public class VoiceRecorder: CAPPlugin {
         let successfullyStartedRecording = customMediaRecorder!.startRecording(recordOptions: recordOptions)
         if successfullyStartedRecording == false {
             customMediaRecorder = nil
+
+            let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "unknown"
+            let isDocumentsWritable = FileManager.default.isWritableFile(atPath: documentsPath)
+
             rejectWithDiagnostics(call,
-                                 Messages.CANNOT_RECORD_ON_THIS_PHONE,
-                                 "CustomMediaRecorder.startRecording returned false")
+                           Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                           "Recording setup failed - check write permissions",
+                           ["requestedDirectory": directory,
+                            "documentsPath": documentsPath,
+                            "documentsWritable": isDocumentsWritable])
         } else {
             isInterrupted = false
             wasInterruptedAndStopped = false
@@ -461,7 +468,7 @@ public class VoiceRecorder: CAPPlugin {
         diagnosticInfo["currentOutputs"] = currentRoute.outputs.map { $0.portType.rawValue }
 
         let fullMessage = "\(baseMessage): \(reason)"
-        call.reject(fullMessage, fullMessage, nil, diagnosticInfo)
+        call.reject(fullMessage, nil, nil, diagnosticInfo)
     }
 
 }
