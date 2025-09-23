@@ -87,12 +87,35 @@ public class VoiceRecorder: CAPPlugin {
         let directory: String? = call.getString("directory")
         let subDirectory: String? = call.getString("subDirectory")
         let recordOptions = RecordOptions(directory: directory, subDirectory: subDirectory)
-        let successfullyStartedRecording = customMediaRecorder!.startRecording(recordOptions: recordOptions)
-        if successfullyStartedRecording == false {
+        let recordingResult = customMediaRecorder!.startRecording(recordOptions: recordOptions)
+
+        if !recordingResult.success {
             customMediaRecorder = nil
+
+            // Build comprehensive error details
+            var errorDetails: [String: Any] = [
+                "requestedDirectory": directory ?? "DOCUMENTS",
+                "requestedSubDirectory": subDirectory ?? "none"
+            ]
+
+            if let recordingError = recordingResult.error {
+                errorDetails["stage"] = recordingError.stage
+                errorDetails["stageDetails"] = recordingError.details
+                errorDetails["stageError"] = recordingError.errorDescription ?? "Unknown error"
+            }
+
+            // Add basic document directory info for compatibility
+            let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "unknown"
+            let isDocumentsWritable = FileManager.default.isWritableFile(atPath: documentsPath)
+            errorDetails["documentsPath"] = documentsPath
+            errorDetails["documentsWritable"] = isDocumentsWritable
+
+            let errorMessage = recordingResult.error?.errorDescription ?? "Recording setup failed"
+
             rejectWithDiagnostics(call,
-                                 Messages.CANNOT_RECORD_ON_THIS_PHONE,
-                                 "CustomMediaRecorder.startRecording returned false")
+                           Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                           errorMessage,
+                           errorDetails)
         } else {
             isInterrupted = false
             wasInterruptedAndStopped = false
@@ -130,12 +153,12 @@ public class VoiceRecorder: CAPPlugin {
             msDuration: getMsDurationOfAudioFile(audioFileUrl),
             path: sendDataAsBase64 ? nil : path
         )
-        
+
         // If we were interrupted, mark that we stopped due to interruption
         if isInterrupted {
             wasInterruptedAndStopped = true
         }
-        
+
         customMediaRecorder = nil
         isInterrupted = false
         if (sendDataAsBase64 && recordData.recordDataBase64 == nil) || recordData.msDuration < 0 {
@@ -264,7 +287,7 @@ public class VoiceRecorder: CAPPlugin {
         // Handle global microphone availability changes
         if isMicrophoneCurrentlyAvailable {
             isMicrophoneCurrentlyAvailable = false
-            
+
             let availabilityData: [String: Any] = [
                 "available": false,
                 "reason": "other_app_started",
@@ -308,7 +331,7 @@ public class VoiceRecorder: CAPPlugin {
         // Handle global microphone availability changes
         if !isMicrophoneCurrentlyAvailable {
             isMicrophoneCurrentlyAvailable = true
-            
+
             let availabilityData: [String: Any] = [
                 "available": true,
                 "reason": "other_app_finished",
@@ -350,7 +373,7 @@ public class VoiceRecorder: CAPPlugin {
             name: AVAudioSession.interruptionNotification,
             object: nil
         )
-        
+
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleAudioSessionRouteChange(_:)),
@@ -376,12 +399,12 @@ public class VoiceRecorder: CAPPlugin {
             switch type {
             case .began:
                 handleRecordingInterruption() // Now handles both recording and global availability
-                
+
             case .ended:
                 // Check if we have an interrupted recording that the main handler might have missed
                 if isInterrupted || wasInterruptedAndStopped {
                     NSLog("VoiceRecorder: Global listener detected interruption ended with active interrupted recording")
-                    
+
                     let interruptionEndedData = [
                         "canResume": true
                     ]
@@ -392,9 +415,9 @@ public class VoiceRecorder: CAPPlugin {
                     isInterrupted = false
                     wasInterruptedAndStopped = false
                 }
-                
+
                 handleInterruptionEnded(userInfo) // Now handles both recording and global availability
-                
+
             @unknown default:
                 break
             }
@@ -406,10 +429,10 @@ public class VoiceRecorder: CAPPlugin {
         let audioSession = AVAudioSession.sharedInstance()
         let wasAvailable = isMicrophoneCurrentlyAvailable
         let isNowAvailable = !audioSession.isOtherAudioPlaying
-        
+
         if wasAvailable != isNowAvailable {
             isMicrophoneCurrentlyAvailable = isNowAvailable
-            
+
             let reason = isNowAvailable ? "other_app_finished" : "other_app_started"
             let availabilityData: [String: Any] = [
                 "available": isNowAvailable,
@@ -461,7 +484,7 @@ public class VoiceRecorder: CAPPlugin {
         diagnosticInfo["currentOutputs"] = currentRoute.outputs.map { $0.portType.rawValue }
 
         let fullMessage = "\(baseMessage): \(reason)"
-        call.reject(fullMessage, fullMessage, nil, diagnosticInfo)
+        call.reject(fullMessage, nil, nil, diagnosticInfo)
     }
 
 }
