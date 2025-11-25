@@ -250,9 +250,9 @@ public class VoiceRecorder: CAPPlugin {
 
         switch type {
         case .began:
-            // Recording was interrupted
+            // Recording was interrupted - check reason before deciding to stop
             NSLog("VoiceRecorder: Interruption began")
-            handleRecordingInterruption()
+            handleRecordingInterruptionWithReason(userInfo)
 
         case .ended:
             // Interruption ended
@@ -262,6 +262,78 @@ public class VoiceRecorder: CAPPlugin {
         @unknown default:
             NSLog("VoiceRecorder: Unknown interruption type: %d", typeValue)
             break
+        }
+    }
+
+    private func handleRecordingInterruptionWithReason(_ userInfo: [AnyHashable: Any]) {
+        guard customMediaRecorder != nil else {
+            return
+        }
+
+        var shouldStopRecording = false
+        var reason = "unknown"
+
+        // iOS 14.5+ - check interruption reason
+        if #available(iOS 14.5, *) {
+            if let reasonValue = userInfo[AVAudioSessionInterruptionReasonKey] as? UInt,
+               let interruptionReason = AVAudioSession.InterruptionReason(rawValue: reasonValue) {
+
+                NSLog("VoiceRecorder: Interruption reason value: %d", reasonValue)
+
+                switch interruptionReason {
+                case .default:
+                    // Phone call or another app using microphone - STOP recording
+                    shouldStopRecording = true
+                    reason = "phone_call"
+                    NSLog("VoiceRecorder: Interruption reason: default (phone call/other app) - stopping recording")
+
+                case .appWasSuspended:
+                    // App went to background - CONTINUE recording in background
+                    shouldStopRecording = false
+                    reason = "app_background"
+                    NSLog("VoiceRecorder: Interruption reason: appWasSuspended - continuing recording in background")
+
+                case .builtInMicMuted:
+                    // Microphone muted by hardware - STOP recording
+                    shouldStopRecording = true
+                    reason = "microphone_muted"
+                    NSLog("VoiceRecorder: Interruption reason: microphone muted - stopping recording")
+
+                @unknown default:
+                    // Unknown reason - be cautious, STOP recording
+                    shouldStopRecording = true
+                    reason = "unknown"
+                    NSLog("VoiceRecorder: Interruption reason: unknown (%d) - stopping recording", reasonValue)
+                }
+            } else {
+                // No reason provided - be cautious, STOP recording
+                shouldStopRecording = true
+                reason = "no_reason_provided"
+                NSLog("VoiceRecorder: No interruption reason provided - stopping recording")
+            }
+        } else {
+            // iOS < 14.5 - no InterruptionReason API available
+            // Be cautious, STOP recording
+            shouldStopRecording = true
+            reason = "ios_version_too_old"
+            NSLog("VoiceRecorder: iOS < 14.5 - no interruption reason API available - stopping recording")
+        }
+
+        // Send event ONLY if we're actually stopping the recording
+        if shouldStopRecording {
+            isInterrupted = true
+
+            let interruptionData: [String: Any] = [
+                "data": [
+                    "reason": reason,
+                    "timestamp": ISO8601DateFormatter().string(from: Date())
+                ]
+            ]
+
+            NSLog("VoiceRecorder: Sending recordingInterrupted - reason: %@", reason)
+            notifyListeners("recordingInterrupted", data: interruptionData)
+        } else {
+            NSLog("VoiceRecorder: Interruption ignored - recording continues")
         }
     }
 

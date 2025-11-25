@@ -245,15 +245,19 @@ public class VoiceRecorder extends Plugin {
         if (audioManager == null) return;
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE)
+            // Use AUDIOFOCUS_GAIN_TRANSIENT instead of EXCLUSIVE
+            // This allows other apps to play audio in background while we record
+            audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                 .setOnAudioFocusChangeListener(audioFocusChangeListener)
                 .build();
             audioManager.requestAudioFocus(audioFocusRequest);
         } else {
+            // Use AUDIOFOCUS_GAIN_TRANSIENT instead of EXCLUSIVE
+            // This allows other apps to play audio in background while we record
             audioManager.requestAudioFocus(
                 audioFocusChangeListener,
                 AudioManager.STREAM_VOICE_CALL,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_EXCLUSIVE
+                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
             );
         }
     }
@@ -300,30 +304,61 @@ public class VoiceRecorder extends Plugin {
         android.util.Log.d("VoiceRecorder", "handleAudioFocusLoss called - canDuck: " + canDuck + ", mediaRecorder: " + (mediaRecorder != null));
 
         // Handle recording interruption if we have an active recording
-        if (mediaRecorder != null) {
-            isInterrupted = true;
-
-            // Pause recording when we lose audio focus
-            CurrentRecordingStatus currentStatus = mediaRecorder.getCurrentStatus();
-            if (currentStatus == CurrentRecordingStatus.RECORDING) {
-                try {
-                    mediaRecorder.pauseRecording();
-                } catch (NotSupportedOsVersion ignored) {
-                    // If pause is not supported, we can't handle interruption gracefully
-                    return;
-                }
-            }
-
-            // Notify JavaScript layer about the recording interruption
-            JSObject interruptionData = new JSObject();
-            JSObject data = new JSObject();
-            data.put("reason", canDuck ? "other_app" : "audio_focus_loss");
-            data.put("timestamp", java.time.Instant.now().toString());
-            interruptionData.put("data", data);
-
-            android.util.Log.d("VoiceRecorder", "Sending recordingInterrupted event to JavaScript - reason: " + data.getString("reason"));
-            notifyListeners("recordingInterrupted", interruptionData);
+        if (mediaRecorder == null) {
+            return;
         }
+
+        AudioManager audioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+        if (audioManager == null) {
+            return;
+        }
+
+        int currentMode = audioManager.getMode();
+
+        // Check if microphone is TRULY blocked by system (phone call, VoIP)
+        // not just audio playback in background (video, music)
+        boolean microphoneBlockedBySystem = (
+            currentMode == AudioManager.MODE_IN_CALL ||           // Phone call
+            currentMode == AudioManager.MODE_IN_COMMUNICATION ||  // VoIP (WhatsApp, Zoom)
+            currentMode == AudioManager.MODE_RINGTONE            // Incoming call ringing
+        );
+
+        android.util.Log.d("VoiceRecorder",
+            "Audio focus lost - mode: " + currentMode +
+            " (0=NORMAL, 1=RINGTONE, 2=IN_CALL, 3=IN_COMMUNICATION), " +
+            "microphone blocked: " + microphoneBlockedBySystem);
+
+        // If mode is NORMAL, it's only background audio (video, music)
+        // Microphone is free - continue recording
+        if (!microphoneBlockedBySystem) {
+            android.util.Log.d("VoiceRecorder", "Audio focus lost but microphone is free - continuing recording in background");
+            return;
+        }
+
+        // Microphone is blocked by system - stop recording
+        isInterrupted = true;
+
+        // Pause recording when we lose audio focus
+        CurrentRecordingStatus currentStatus = mediaRecorder.getCurrentStatus();
+        if (currentStatus == CurrentRecordingStatus.RECORDING) {
+            try {
+                mediaRecorder.pauseRecording();
+            } catch (NotSupportedOsVersion ignored) {
+                // If pause is not supported, we can't handle interruption gracefully
+                return;
+            }
+        }
+
+        // Notify JavaScript layer about the microphone being blocked
+        JSObject interruptionData = new JSObject();
+        JSObject data = new JSObject();
+        data.put("reason", getModeReason(currentMode));
+        data.put("audioMode", currentMode);
+        data.put("timestamp", java.time.Instant.now().toString());
+        interruptionData.put("data", data);
+
+        android.util.Log.d("VoiceRecorder", "Sending recordingInterrupted - microphone blocked by: " + getModeReason(currentMode));
+        notifyListeners("recordingInterrupted", interruptionData);
     }
 
     private void handleAudioFocusGain() {
@@ -345,6 +380,18 @@ public class VoiceRecorder extends Plugin {
         }
     }
 
+    private String getModeReason(int audioMode) {
+        switch (audioMode) {
+            case AudioManager.MODE_IN_CALL:
+                return "phone_call";
+            case AudioManager.MODE_IN_COMMUNICATION:
+                return "voip_call";
+            case AudioManager.MODE_RINGTONE:
+                return "incoming_call";
+            default:
+                return "unknown";
+        }
+    }
 
     @Override
     public void load() {
