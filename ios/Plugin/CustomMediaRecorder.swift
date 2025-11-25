@@ -96,7 +96,9 @@ class CustomMediaRecorder {
             }
 
             originalRecordingSessionCategory = recordingSession.category
-            try recordingSession.setCategory(AVAudioSession.Category.playAndRecord)
+            // Use .mixWithOthers to allow WebView/other apps to play audio while recording
+            // Use .defaultToSpeaker to route audio to speaker by default
+            try recordingSession.setCategory(.playAndRecord, options: [.mixWithOthers, .defaultToSpeaker])
             try recordingSession.setActive(true)
 
             // Get updated session info after configuration
@@ -141,8 +143,8 @@ class CustomMediaRecorder {
             if !audioRecorder.prepareToRecord() {
                 let recorderDetails: [String: Any] = [
                     "isRecording": audioRecorder.isRecording,
-                    "format": audioRecorder.format?.description ?? "unknown",
-                    "url": audioRecorder.url?.path ?? "unknown"
+                    "format": audioRecorder.format.description,
+                    "url": audioRecorder.url.path
                 ]
                 return RecordingResult.failure(
                     stage: "recorder_prepare",

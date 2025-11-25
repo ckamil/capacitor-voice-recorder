@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import Capacitor
+import CallKit
 
 @objc(VoiceRecorder)
 public class VoiceRecorder: CAPPlugin {
@@ -282,10 +283,28 @@ public class VoiceRecorder: CAPPlugin {
 
                 switch interruptionReason {
                 case .default:
-                    // Phone call or another app using microphone - STOP recording
-                    shouldStopRecording = true
-                    reason = "phone_call"
-                    NSLog("VoiceRecorder: Interruption reason: default (phone call/other app) - stopping recording")
+                    // .default can mean:
+                    // 1. Phone call / VoIP call (microphone occupied)
+                    // 2. Video playback in WebView (only audio playback, microphone free)
+
+                    // Use CallKit to check if there's an actual phone call
+                    let callObserver = CXCallObserver()
+                    let activeCalls = callObserver.calls
+                    let hasActivePhoneCall = !activeCalls.isEmpty
+
+                    NSLog("VoiceRecorder: Interruption reason: default - checking for phone call, active calls: %d", activeCalls.count)
+
+                    if hasActivePhoneCall {
+                        // Real phone call detected - STOP recording
+                        shouldStopRecording = true
+                        reason = "phone_call"
+                        NSLog("VoiceRecorder: Active phone call detected - stopping recording")
+                    } else {
+                        // No phone call - likely WebView video or background music - CONTINUE recording
+                        shouldStopRecording = false
+                        reason = "background_audio"
+                        NSLog("VoiceRecorder: No phone call detected - continuing recording (likely WebView video/music)")
+                    }
 
                 case .appWasSuspended:
                     // App went to background - CONTINUE recording in background
