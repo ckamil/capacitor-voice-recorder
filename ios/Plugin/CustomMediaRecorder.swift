@@ -96,10 +96,20 @@ class CustomMediaRecorder {
             }
 
             originalRecordingSessionCategory = recordingSession.category
+            // Fix for OSStatus error 560557684 (AVAudioSessionErrorCodeCannotInterruptOthers)
             // Use .mixWithOthers to allow WebView/other apps to play audio while recording
-            // Use .defaultToSpeaker to route audio to speaker by default
-            try recordingSession.setCategory(.playAndRecord, options: [.mixWithOthers, .defaultToSpeaker])
+            // Removed .defaultToSpeaker from setCategory to avoid routing conflicts with WebView audio session
+            try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
             try recordingSession.setActive(true)
+
+            // Optionally route audio to speaker instead of receiver (earpiece)
+            // Done after session activation to avoid routing conflicts with other audio sessions
+            // If this fails, recording continues anyway (non-critical)
+            do {
+                try recordingSession.overrideOutputAudioPort(.speaker)
+            } catch {
+                NSLog("CustomMediaRecorder: Failed to override output to speaker (non-critical): \(error.localizedDescription)")
+            }
 
             // Get updated session info after configuration
             let updatedAudioSessionDetails: [String: Any] = [
