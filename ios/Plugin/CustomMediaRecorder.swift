@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import UIKit
 
 struct RecordingError {
     let stage: String
@@ -102,14 +103,24 @@ class CustomMediaRecorder {
             try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
             try recordingSession.setActive(true)
 
-            // Optionally route audio to speaker instead of receiver (earpiece)
-            // Done after session activation to avoid routing conflicts with other audio sessions
-            // If this fails, recording continues anyway (non-critical)
-            do {
-                try recordingSession.overrideOutputAudioPort(.speaker)
-            } catch {
-                NSLog("CustomMediaRecorder: Failed to override output to speaker (non-critical): \(error.localizedDescription)")
+            // Only override output to speaker on iPhone (has receiver/earpiece).
+            // iPads don't have a receiver so this call is unnecessary and can
+            // destabilise the audio session, causing AVAudioRecorder.record() to
+            // return false.  See: https://developer.apple.com/documentation/avfaudio/avaudiosession/1616443-overrideoutputaudioport
+            let isIPad = UIDevice.current.userInterfaceIdiom == .pad
+            if !isIPad {
+                do {
+                    try recordingSession.overrideOutputAudioPort(.speaker)
+                } catch {
+                    NSLog("CustomMediaRecorder: Failed to override output to speaker (non-critical): \(error.localizedDescription)")
+                }
+            } else {
+                NSLog("CustomMediaRecorder: Skipping overrideOutputAudioPort on iPad (no receiver)")
             }
+
+            // Small stabilisation delay – gives the audio session time to settle
+            // after category/route changes before we attempt to record.
+            Thread.sleep(forTimeInterval: 0.15)
 
             // Get updated session info after configuration
             let updatedAudioSessionDetails: [String: Any] = [
@@ -163,16 +174,43 @@ class CustomMediaRecorder {
                 )
             }
 
-            let recordResult = audioRecorder.record()
+            // Retry record() with audio session reset between attempts.
+            // AVAudioRecorder.record() can return false when the audio session
+            // is transiently busy (e.g. WKWebView audio conflict on iPad).
+            let maxRecordAttempts = 3
+            var recordResult = false
+            for attempt in 1...maxRecordAttempts {
+                recordResult = audioRecorder.record()
+                if recordResult {
+                    if attempt > 1 {
+                        NSLog("CustomMediaRecorder: record() succeeded on attempt %d", attempt)
+                    }
+                    break
+                }
+
+                NSLog("CustomMediaRecorder: record() returned false on attempt %d/%d", attempt, maxRecordAttempts)
+
+                if attempt < maxRecordAttempts {
+                    // Reset audio session and re-prepare before retrying
+                    audioRecorder.stop()
+                    try recordingSession.setActive(false)
+                    Thread.sleep(forTimeInterval: 0.3)
+                    try recordingSession.setActive(true)
+                    audioRecorder.prepareToRecord()
+                }
+            }
+
             if !recordResult {
                 let finalRecorderDetails: [String: Any] = [
                     "isRecording": audioRecorder.isRecording,
-                    "currentTime": audioRecorder.currentTime
+                    "currentTime": audioRecorder.currentTime,
+                    "totalAttempts": maxRecordAttempts,
+                    "isIPad": isIPad
                 ]
                 return RecordingResult.failure(
                     stage: "recorder_start",
                     details: finalRecorderDetails,
-                    errorDescription: "AVAudioRecorder.record() returned false"
+                    errorDescription: "AVAudioRecorder.record() returned false after \(maxRecordAttempts) attempts"
                 )
             }
 
