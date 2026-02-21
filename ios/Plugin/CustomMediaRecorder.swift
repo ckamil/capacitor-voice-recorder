@@ -118,9 +118,11 @@ class CustomMediaRecorder {
                 NSLog("CustomMediaRecorder: Skipping overrideOutputAudioPort on iPad (no receiver)")
             }
 
-            // Small stabilisation delay – gives the audio session time to settle
+            // Stabilisation delay – gives the audio session time to settle
             // after category/route changes before we attempt to record.
-            Thread.sleep(forTimeInterval: 0.15)
+            // iPad needs a longer delay due to WKWebView audio session conflicts.
+            let stabilisationDelay: TimeInterval = isIPad ? 0.5 : 0.15
+            Thread.sleep(forTimeInterval: stabilisationDelay)
 
             // Get updated session info after configuration
             let updatedAudioSessionDetails: [String: Any] = [
@@ -174,7 +176,7 @@ class CustomMediaRecorder {
                 )
             }
 
-            // Retry record() with audio session reset between attempts.
+            // Retry record() with hard audio session reset between attempts.
             // AVAudioRecorder.record() can return false when the audio session
             // is transiently busy (e.g. WKWebView audio conflict on iPad).
             let maxRecordAttempts = 3
@@ -188,24 +190,49 @@ class CustomMediaRecorder {
                     break
                 }
 
-                NSLog("CustomMediaRecorder: record() returned false on attempt %d/%d", attempt, maxRecordAttempts)
+                NSLog("CustomMediaRecorder: record() returned false on attempt %d/%d – inputs: %@, outputs: %@, category: %@",
+                      attempt, maxRecordAttempts,
+                      recordingSession.currentRoute.inputs.map { $0.portType.rawValue }.description,
+                      recordingSession.currentRoute.outputs.map { $0.portType.rawValue }.description,
+                      recordingSession.category.rawValue)
 
                 if attempt < maxRecordAttempts {
-                    // Reset audio session and re-prepare before retrying
+                    // Hard reset: tear down recorder, switch to .ambient to fully
+                    // release the audio session, then reconfigure from scratch.
                     audioRecorder.stop()
-                    try recordingSession.setActive(false)
-                    Thread.sleep(forTimeInterval: 0.3)
+                    audioRecorder = nil
+
+                    try recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
+                    try recordingSession.setCategory(.ambient)
+                    Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.3)
+
+                    try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
                     try recordingSession.setActive(true)
+
+                    if !isIPad {
+                        try? recordingSession.overrideOutputAudioPort(.speaker)
+                    }
+                    Thread.sleep(forTimeInterval: isIPad ? 0.3 : 0.15)
+
+                    // Recreate AVAudioRecorder with a fresh file path
+                    audioFilePath = getDirectoryToSaveAudioFile().appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
+                    audioRecorder = try AVAudioRecorder(url: audioFilePath, settings: settings)
                     audioRecorder.prepareToRecord()
                 }
             }
 
             if !recordResult {
                 let finalRecorderDetails: [String: Any] = [
-                    "isRecording": audioRecorder.isRecording,
-                    "currentTime": audioRecorder.currentTime,
+                    "isRecording": audioRecorder?.isRecording ?? false,
+                    "currentTime": audioRecorder?.currentTime ?? -1,
                     "totalAttempts": maxRecordAttempts,
-                    "isIPad": isIPad
+                    "isIPad": isIPad,
+                    "categoryAfterRetries": recordingSession.category.rawValue,
+                    "isOtherAudioPlayingAfterRetries": recordingSession.isOtherAudioPlaying,
+                    "inputsAfterRetries": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
+                    "outputsAfterRetries": recordingSession.currentRoute.outputs.map { $0.portType.rawValue },
+                    "availableInputsAfterRetries": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? [],
+                    "stabilisationDelay": isIPad ? 0.5 : 0.15
                 ]
                 return RecordingResult.failure(
                     stage: "recorder_start",
