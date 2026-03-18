@@ -28,7 +28,7 @@ struct RecordingResult {
     }
 }
 
-class CustomMediaRecorder {
+class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
 
     var options: RecordOptions!
     private var recordingSession: AVAudioSession!
@@ -66,10 +66,43 @@ class CustomMediaRecorder {
         return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
     }
 
+    private func getDeviceInfo() -> [String: String] {
+        let device = UIDevice.current
+        return [
+            "model": device.model,
+            "systemVersion": device.systemVersion,
+            "name": device.name,
+            "idiom": device.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+        ]
+    }
+
+    // MARK: - AVAudioRecorderDelegate
+
+    func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
+        NSLog("CustomMediaRecorder: Encode error occurred: %@", error?.localizedDescription ?? "unknown")
+    }
+
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        if !flag {
+            NSLog("CustomMediaRecorder: Recording finished unsuccessfully")
+        }
+    }
+
     func startRecording(recordOptions: RecordOptions) -> RecordingResult {
         do {
             options = recordOptions
             recordingSession = AVAudioSession.sharedInstance()
+            let isIPad = UIDevice.current.userInterfaceIdiom == .pad
+            let deviceInfo = getDeviceInfo()
+
+            // Proactive cleanup: if session is stuck in .playAndRecord from a previous failed stop, reset it
+            let needsCleanup = recordingSession.category == .playAndRecord
+            if needsCleanup {
+                NSLog("CustomMediaRecorder: Detected leftover .playAndRecord category, cleaning up")
+                try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
+                try? recordingSession.setCategory(.ambient)
+                Thread.sleep(forTimeInterval: 0.2)
+            }
 
             let audioSessionDetails: [String: Any] = [
                 "category": recordingSession.category.rawValue,
@@ -77,7 +110,8 @@ class CustomMediaRecorder {
                 "availableInputsCount": recordingSession.availableInputs?.count ?? 0,
                 "currentInputs": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
                 "currentOutputs": recordingSession.currentRoute.outputs.map { $0.portType.rawValue },
-                "availableInputs": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? []
+                "availableInputs": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? [],
+                "deviceInfo": deviceInfo
             ]
 
             if recordingSession.isOtherAudioPlaying {
@@ -96,27 +130,15 @@ class CustomMediaRecorder {
                 )
             }
 
-            originalRecordingSessionCategory = recordingSession.category
-            // Fix for OSStatus error 560557684 (AVAudioSessionErrorCodeCannotInterruptOthers)
-            // Use .mixWithOthers to allow WebView/other apps to play audio while recording
-            // Removed .defaultToSpeaker from setCategory to avoid routing conflicts with WebView audio session
-            try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
+            // If cleanup was needed, always restore to .ambient regardless of whether
+            // setCategory(.ambient) succeeded — prevents a cycle where
+            // originalRecordingSessionCategory captures .playAndRecord from a stuck session,
+            // stopRecording() restores it back, and the next start is stuck again (Pattern B).
+            originalRecordingSessionCategory = needsCleanup ? .ambient : recordingSession.category
+            // Step 1: Pure .playAndRecord — claim exclusive mic access on iPad
+            // Do NOT use .mixWithOthers here — it prevents priority mic access on iPad
+            try recordingSession.setCategory(.playAndRecord)
             try recordingSession.setActive(true)
-
-            // Only override output to speaker on iPhone (has receiver/earpiece).
-            // iPads don't have a receiver so this call is unnecessary and can
-            // destabilise the audio session, causing AVAudioRecorder.record() to
-            // return false.  See: https://developer.apple.com/documentation/avfaudio/avaudiosession/1616443-overrideoutputaudioport
-            let isIPad = UIDevice.current.userInterfaceIdiom == .pad
-            if !isIPad {
-                do {
-                    try recordingSession.overrideOutputAudioPort(.speaker)
-                } catch {
-                    NSLog("CustomMediaRecorder: Failed to override output to speaker (non-critical): \(error.localizedDescription)")
-                }
-            } else {
-                NSLog("CustomMediaRecorder: Skipping overrideOutputAudioPort on iPad (no receiver)")
-            }
 
             // Stabilisation delay – gives the audio session time to settle
             // after category/route changes before we attempt to record.
@@ -124,25 +146,19 @@ class CustomMediaRecorder {
             let stabilisationDelay: TimeInterval = isIPad ? 0.5 : 0.15
             Thread.sleep(forTimeInterval: stabilisationDelay)
 
-            // Get updated session info after configuration
-            let updatedAudioSessionDetails: [String: Any] = [
-                "newCategory": recordingSession.category.rawValue,
-                "currentInputsAfterSetup": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
-                "currentOutputsAfterSetup": recordingSession.currentRoute.outputs.map { $0.portType.rawValue }
-            ]
-
-            audioFilePath = getDirectoryToSaveAudioFile().appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
+            let outputDir = getDirectoryToSaveAudioFile()
+            audioFilePath = outputDir.appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
 
             // Check file path accessibility
             let parentDir = audioFilePath.deletingLastPathComponent()
-            let filePathDetails: [String: Any] = [
-                "audioFilePath": audioFilePath.path,
-                "parentDir": parentDir.path,
-                "parentDirWritable": FileManager.default.isWritableFile(atPath: parentDir.path),
-                "parentDirExists": FileManager.default.fileExists(atPath: parentDir.path)
-            ]
-
-            if !FileManager.default.isWritableFile(atPath: parentDir.path) {
+            let parentDirWritable = FileManager.default.isWritableFile(atPath: parentDir.path)
+            if !parentDirWritable {
+                let filePathDetails: [String: Any] = [
+                    "audioFilePath": audioFilePath.path,
+                    "parentDir": parentDir.path,
+                    "parentDirWritable": parentDirWritable,
+                    "parentDirExists": FileManager.default.fileExists(atPath: parentDir.path)
+                ]
                 return RecordingResult.failure(
                     stage: "file_path_check",
                     details: filePathDetails,
@@ -151,17 +167,7 @@ class CustomMediaRecorder {
             }
 
             audioRecorder = try AVAudioRecorder(url: audioFilePath, settings: settings)
-
-            if audioRecorder == nil {
-                return RecordingResult.failure(
-                    stage: "recorder_creation",
-                    details: [
-                        "settings": settings,
-                        "audioFilePath": audioFilePath.path
-                    ],
-                    errorDescription: "Failed to create AVAudioRecorder"
-                )
-            }
+            audioRecorder.delegate = self
 
             if !audioRecorder.prepareToRecord() {
                 let recorderDetails: [String: Any] = [
@@ -178,15 +184,31 @@ class CustomMediaRecorder {
 
             // Retry record() with hard audio session reset between attempts.
             // AVAudioRecorder.record() can return false when the audio session
-            // is transiently busy (e.g. WKWebView audio conflict on iPad).
+            // is transiently busy (e.g. WKWebView audio session conflict on iPad).
             let maxRecordAttempts = 3
             var recordResult = false
             for attempt in 1...maxRecordAttempts {
+                NSLog("CustomMediaRecorder: [attempt %d] inputAvailable=%@, category=%@, mode=%@, sampleRate=%.0f",
+                    attempt, recordingSession.isInputAvailable ? "true" : "false",
+                    recordingSession.category.rawValue, recordingSession.mode.rawValue,
+                    recordingSession.sampleRate)
+
                 recordResult = audioRecorder.record()
+
+                // Fallback: try record(atTime:forDuration:) if record() returns false
+                if !recordResult {
+                    recordResult = audioRecorder.record(atTime: audioRecorder.deviceCurrentTime + 0.1, forDuration: 36000)
+                    if recordResult {
+                        NSLog("CustomMediaRecorder: record(atTime:forDuration:) worked as fallback on attempt %d", attempt)
+                    }
+                }
+
                 if recordResult {
                     if attempt > 1 {
                         NSLog("CustomMediaRecorder: record() succeeded on attempt %d", attempt)
                     }
+                    // Step 2: Enable mixing so WebView can play presentations alongside recording
+                    try? recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
                     break
                 }
 
@@ -204,20 +226,22 @@ class CustomMediaRecorder {
 
                     try recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
                     try recordingSession.setCategory(.ambient)
-                    Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.3)
+                    Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
 
-                    try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
+                    // Use pure .playAndRecord without .mixWithOthers for retry
+                    try recordingSession.setCategory(.playAndRecord)
                     try recordingSession.setActive(true)
 
-                    if !isIPad {
-                        try? recordingSession.overrideOutputAudioPort(.speaker)
-                    }
-                    Thread.sleep(forTimeInterval: isIPad ? 0.3 : 0.15)
+                    Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.15)
 
                     // Recreate AVAudioRecorder with a fresh file path
-                    audioFilePath = getDirectoryToSaveAudioFile().appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
+                    audioFilePath = outputDir.appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
                     audioRecorder = try AVAudioRecorder(url: audioFilePath, settings: settings)
-                    audioRecorder.prepareToRecord()
+                    audioRecorder.delegate = self
+                    if !audioRecorder.prepareToRecord() {
+                        NSLog("CustomMediaRecorder: prepareToRecord() failed on retry attempt %d", attempt)
+                        // Don't continue — tear down and retry from scratch on next iteration
+                    }
                 }
             }
 
@@ -232,7 +256,10 @@ class CustomMediaRecorder {
                     "inputsAfterRetries": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
                     "outputsAfterRetries": recordingSession.currentRoute.outputs.map { $0.portType.rawValue },
                     "availableInputsAfterRetries": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? [],
-                    "stabilisationDelay": isIPad ? 0.5 : 0.15
+                    "stabilisationDelay": isIPad ? 0.5 : 0.15,
+                    "deviceModel": deviceInfo["model"] ?? "unknown",
+                    "iosVersion": deviceInfo["systemVersion"] ?? "unknown",
+                    "deviceIdiom": deviceInfo["idiom"] ?? "unknown"
                 ]
                 return RecordingResult.failure(
                     stage: "recorder_start",
@@ -245,11 +272,15 @@ class CustomMediaRecorder {
             return RecordingResult.success()
 
         } catch let error {
+            let catchDeviceInfo = getDeviceInfo()
             let errorDetails: [String: Any] = [
                 "errorDescription": error.localizedDescription,
                 "domain": (error as NSError).domain,
                 "code": (error as NSError).code,
-                "userInfo": (error as NSError).userInfo
+                "userInfo": (error as NSError).userInfo,
+                "deviceModel": catchDeviceInfo["model"] ?? "unknown",
+                "iosVersion": catchDeviceInfo["systemVersion"] ?? "unknown",
+                "deviceIdiom": catchDeviceInfo["idiom"] ?? "unknown"
             ]
             return RecordingResult.failure(
                 stage: "exception",
@@ -260,15 +291,28 @@ class CustomMediaRecorder {
     }
 
     func stopRecording() {
+        audioRecorder?.stop()
+
+        // Attempt each cleanup step independently so a failure in one
+        // doesn't skip the others (root cause of orphaned session / Pattern A).
         do {
-            audioRecorder.stop()
-            try recordingSession.setActive(false)
-            try recordingSession.setCategory(originalRecordingSessionCategory)
-            originalRecordingSessionCategory = nil
-            audioRecorder = nil
-            recordingSession = nil
-            status = CurrentRecordingStatus.NONE
-        } catch {}
+            try recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            NSLog("CustomMediaRecorder: stopRecording setActive(false) failed: %@", error.localizedDescription)
+        }
+
+        if let orig = originalRecordingSessionCategory {
+            do {
+                try recordingSession?.setCategory(orig)
+            } catch {
+                NSLog("CustomMediaRecorder: stopRecording setCategory failed: %@", error.localizedDescription)
+            }
+        }
+
+        originalRecordingSessionCategory = nil
+        audioRecorder = nil
+        recordingSession = nil
+        status = CurrentRecordingStatus.NONE
     }
 
     func getOutputFile() -> URL {
