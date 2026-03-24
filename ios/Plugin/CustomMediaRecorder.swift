@@ -89,6 +89,11 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
     }
 
     func startRecording(recordOptions: RecordOptions) -> RecordingResult {
+        // Declared outside do/catch so diagnostics are available in catch block
+        var activatedWithMixing = false
+        var activationErrors: [[String: Any]] = []
+        var needsCleanup = false
+
         do {
             options = recordOptions
             recordingSession = AVAudioSession.sharedInstance()
@@ -96,7 +101,7 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
             let deviceInfo = getDeviceInfo()
 
             // Proactive cleanup: if session is stuck in .playAndRecord from a previous failed stop, reset it
-            let needsCleanup = recordingSession.category == .playAndRecord
+            needsCleanup = recordingSession.category == .playAndRecord
             if needsCleanup {
                 NSLog("CustomMediaRecorder: Detected leftover .playAndRecord category, cleaning up")
                 try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
@@ -114,12 +119,12 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                 "deviceInfo": deviceInfo
             ]
 
+            // Note: isOtherAudioPlaying is NOT a blocking condition.
+            // WebView presentations with audio+video run during recording — iOS reports
+            // them as "other audio playing" but recording must proceed alongside them.
             if recordingSession.isOtherAudioPlaying {
-                return RecordingResult.failure(
-                    stage: "audio_session_check",
-                    details: audioSessionDetails,
-                    errorDescription: "Other audio is playing"
-                )
+                NSLog("CustomMediaRecorder: WARNING - other audio is playing (category: %@), proceeding anyway (likely WebView presentation)",
+                      recordingSession.category.rawValue)
             }
 
             if recordingSession.availableInputs?.isEmpty == true {
@@ -135,10 +140,91 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
             // originalRecordingSessionCategory captures .playAndRecord from a stuck session,
             // stopRecording() restores it back, and the next start is stuck again (Pattern B).
             originalRecordingSessionCategory = needsCleanup ? .ambient : recordingSession.category
-            // Step 1: Pure .playAndRecord — claim exclusive mic access on iPad
-            // Do NOT use .mixWithOthers here — it prevents priority mic access on iPad
-            try recordingSession.setCategory(.playAndRecord)
-            try recordingSession.setActive(true)
+
+            // Session activation with retry and .mixWithOthers fallback.
+            // Attempt 1-2: pure .playAndRecord (exclusive mic access, best for iPad).
+            // Attempt 3: .playAndRecord + .mixWithOthers (allows coexistence with WebView
+            //            presentation audio — trades mic priority for compatibility).
+            // Previous approach (commit 9fb5312) always used .mixWithOthers which fixed
+            // error 560557684 but caused record() to return false on iPad.
+            // Previous approach (commit 887130c) removed .mixWithOthers which fixed
+            // record() but reintroduced 560557684 on setActive().
+            // This retry strategy tries pure first, falls back to mixing only if needed.
+            let maxActivationAttempts = 3
+            var activationSuccess = false
+
+            for activationAttempt in 1...maxActivationAttempts {
+                do {
+                    if activationAttempt <= 2 {
+                        // Attempts 1-2: pure .playAndRecord (exclusive mic access)
+                        if activationAttempt == 2 {
+                            // Hard reset before second attempt
+                            NSLog("CustomMediaRecorder: setActive retry %d - hard reset", activationAttempt)
+                            try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
+                            try? recordingSession.setCategory(.ambient)
+                            Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
+                        }
+                        try recordingSession.setCategory(.playAndRecord)
+                    } else {
+                        // Attempt 3: fallback to .mixWithOthers
+                        NSLog("CustomMediaRecorder: setActive retry %d - falling back to .mixWithOthers", activationAttempt)
+                        try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
+                        try? recordingSession.setCategory(.ambient)
+                        Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
+                        try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
+                        activatedWithMixing = true
+                    }
+
+                    try recordingSession.setActive(true)
+                    activationSuccess = true
+                    NSLog("CustomMediaRecorder: setActive succeeded on attempt %d/%d%@, category=%@, inputs=%@, outputs=%@",
+                          activationAttempt, maxActivationAttempts,
+                          activatedWithMixing ? " (with .mixWithOthers fallback)" : "",
+                          recordingSession.category.rawValue,
+                          recordingSession.currentRoute.inputs.map { $0.portType.rawValue }.description,
+                          recordingSession.currentRoute.outputs.map { $0.portType.rawValue }.description)
+                    break
+
+                } catch {
+                    let attemptError: [String: Any] = [
+                        "attempt": activationAttempt,
+                        "error": error.localizedDescription,
+                        "domain": (error as NSError).domain,
+                        "code": (error as NSError).code,
+                        "category": recordingSession.category.rawValue,
+                        "isOtherAudioPlaying": recordingSession.isOtherAudioPlaying,
+                        "currentInputs": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
+                        "currentOutputs": recordingSession.currentRoute.outputs.map { $0.portType.rawValue },
+                        "availableInputs": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? []
+                    ]
+                    activationErrors.append(attemptError)
+                    NSLog("CustomMediaRecorder: setActive failed attempt %d/%d: %@ (domain: %@, code: %ld)",
+                          activationAttempt, maxActivationAttempts,
+                          error.localizedDescription, (error as NSError).domain, (error as NSError).code)
+                }
+            }
+
+            if !activationSuccess {
+                return RecordingResult.failure(
+                    stage: "session_activation",
+                    details: [
+                        "totalAttempts": maxActivationAttempts,
+                        "activationErrors": activationErrors,
+                        "isIPad": isIPad,
+                        "needsCleanup": needsCleanup,
+                        "categoryBeforeStart": originalRecordingSessionCategory?.rawValue ?? "nil",
+                        "finalCategory": recordingSession.category.rawValue,
+                        "isOtherAudioPlaying": recordingSession.isOtherAudioPlaying,
+                        "availableInputs": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? [],
+                        "currentInputs": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
+                        "currentOutputs": recordingSession.currentRoute.outputs.map { $0.portType.rawValue },
+                        "deviceModel": deviceInfo["model"] ?? "unknown",
+                        "iosVersion": deviceInfo["systemVersion"] ?? "unknown",
+                        "deviceIdiom": deviceInfo["idiom"] ?? "unknown"
+                    ],
+                    errorDescription: "Session activation failed after \(maxActivationAttempts) attempts"
+                )
+            }
 
             // Stabilisation delay – gives the audio session time to settle
             // after category/route changes before we attempt to record.
@@ -208,7 +294,10 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                         NSLog("CustomMediaRecorder: record() succeeded on attempt %d", attempt)
                     }
                     // Step 2: Enable mixing so WebView can play presentations alongside recording
-                    try? recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
+                    // Skip if .mixWithOthers was already used as activation fallback
+                    if !activatedWithMixing {
+                        try? recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
+                    }
                     break
                 }
 
@@ -257,6 +346,10 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                     "outputsAfterRetries": recordingSession.currentRoute.outputs.map { $0.portType.rawValue },
                     "availableInputsAfterRetries": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? [],
                     "stabilisationDelay": isIPad ? 0.5 : 0.15,
+                    "activatedWithMixing": activatedWithMixing,
+                    "activationErrors": activationErrors,
+                    "needsCleanup": needsCleanup,
+                    "isOtherAudioPlayingAtStart": recordingSession.isOtherAudioPlaying,
                     "deviceModel": deviceInfo["model"] ?? "unknown",
                     "iosVersion": deviceInfo["systemVersion"] ?? "unknown",
                     "deviceIdiom": deviceInfo["idiom"] ?? "unknown"
@@ -278,6 +371,14 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                 "domain": (error as NSError).domain,
                 "code": (error as NSError).code,
                 "userInfo": (error as NSError).userInfo,
+                "activatedWithMixing": activatedWithMixing,
+                "activationErrors": activationErrors,
+                "needsCleanup": needsCleanup,
+                "originalCategory": originalRecordingSessionCategory?.rawValue ?? "nil",
+                "isOtherAudioPlaying": recordingSession?.isOtherAudioPlaying ?? false,
+                "availableInputs": recordingSession?.availableInputs?.map { $0.portType.rawValue } ?? [],
+                "currentInputs": recordingSession?.currentRoute.inputs.map { $0.portType.rawValue } ?? [],
+                "currentOutputs": recordingSession?.currentRoute.outputs.map { $0.portType.rawValue } ?? [],
                 "deviceModel": catchDeviceInfo["model"] ?? "unknown",
                 "iosVersion": catchDeviceInfo["systemVersion"] ?? "unknown",
                 "deviceIdiom": catchDeviceInfo["idiom"] ?? "unknown"

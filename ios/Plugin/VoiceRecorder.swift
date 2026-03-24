@@ -47,22 +47,19 @@ public class VoiceRecorder: CAPPlugin {
         // Check audio session state before creating recorder
         let audioSession = AVAudioSession.sharedInstance()
 
+        // Note: isOtherAudioPlaying is NOT a blocking condition.
+        // WebView presentations with audio+video run during recording — iOS reports
+        // them as "other audio playing" but recording must proceed alongside them.
+        // CustomMediaRecorder handles this via .mixWithOthers fallback strategy.
         if audioSession.isOtherAudioPlaying {
-            // Try cleanup first if it might be our orphaned session
+            NSLog("VoiceRecorder: Other audio is playing (category: %@), proceeding - likely WebView presentation",
+                  audioSession.category.rawValue)
+            // Cleanup orphaned .playAndRecord session if detected
             if audioSession.category == .playAndRecord {
-                NSLog("VoiceRecorder: Detected playAndRecord with otherAudioPlaying, attempting cleanup")
-                try? audioSession.setActive(false)
+                NSLog("VoiceRecorder: Detected orphaned .playAndRecord with otherAudioPlaying, cleaning up")
+                try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
                 try? audioSession.setCategory(.ambient)
-                Thread.sleep(forTimeInterval: 0.1)
-            }
-
-            // Check again after cleanup attempt
-            if audioSession.isOtherAudioPlaying {
-                rejectWithDiagnostics(call,
-                                     Messages.CANNOT_RECORD_ON_THIS_PHONE,
-                                     "Other audio application is active",
-                                     ["otherAudioPlaying": true, "cleanupAttempted": audioSession.category == .playAndRecord])
-                return
+                Thread.sleep(forTimeInterval: 0.2)
             }
         }
 
