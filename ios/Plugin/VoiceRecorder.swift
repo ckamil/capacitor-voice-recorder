@@ -6,7 +6,7 @@ import CallKit
 @objc(VoiceRecorder)
 public class VoiceRecorder: CAPPlugin {
 
-    private var customMediaRecorder: CustomMediaRecorder?
+    private var customMediaRecorder: RecorderInterface?
     private var isInterrupted: Bool = false
     private var wasInterruptedAndStopped: Bool = false // Tracks if we stopped recording due to interruption
     private var isMicrophoneCurrentlyAvailable: Bool = true
@@ -74,51 +74,76 @@ public class VoiceRecorder: CAPPlugin {
         // Setup audio session interruption handling
         setupAudioSessionInterruptionHandling()
 
-        customMediaRecorder = CustomMediaRecorder()
-        if customMediaRecorder == nil {
-            rejectWithDiagnostics(call,
-                                 Messages.CANNOT_RECORD_ON_THIS_PHONE,
-                                 "Failed to initialize CustomMediaRecorder")
-            return
-        }
-
         let directory: String? = call.getString("directory")
         let subDirectory: String? = call.getString("subDirectory")
         let recordOptions = RecordOptions(directory: directory, subDirectory: subDirectory)
-        let recordingResult = customMediaRecorder!.startRecording(recordOptions: recordOptions)
 
-        if !recordingResult.success {
-            customMediaRecorder = nil
+        // Try AVAudioEngine first (resilient to record()=false with .mixWithOthers on iPad),
+        // fall back to AVAudioRecorder if Engine fails.
+        let engineRecorder = AudioEngineRecorder()
+        let engineResult = engineRecorder.startRecording(recordOptions: recordOptions)
 
-            // Build comprehensive error details
-            var errorDetails: [String: Any] = [
-                "requestedDirectory": directory ?? "DOCUMENTS",
-                "requestedSubDirectory": subDirectory ?? "none"
-            ]
-
-            if let recordingError = recordingResult.error {
-                errorDetails["stage"] = recordingError.stage
-                errorDetails["stageDetails"] = recordingError.details
-                errorDetails["stageError"] = recordingError.errorDescription ?? "Unknown error"
-            }
-
-            // Add basic document directory info for compatibility
-            let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "unknown"
-            let isDocumentsWritable = FileManager.default.isWritableFile(atPath: documentsPath)
-            errorDetails["documentsPath"] = documentsPath
-            errorDetails["documentsWritable"] = isDocumentsWritable
-
-            let errorMessage = recordingResult.error?.errorDescription ?? "Recording setup failed"
-
-            rejectWithDiagnostics(call,
-                           Messages.CANNOT_RECORD_ON_THIS_PHONE,
-                           errorMessage,
-                           errorDetails)
-        } else {
+        if engineResult.success {
+            customMediaRecorder = engineRecorder
+            NSLog("VoiceRecorder: Recording started with AudioEngineRecorder")
             isInterrupted = false
             wasInterruptedAndStopped = false
             call.resolve(ResponseGenerator.successResponse())
+            return
         }
+
+        NSLog("VoiceRecorder: AudioEngine failed (%@), falling back to AVAudioRecorder",
+              engineResult.error?.errorDescription ?? "unknown")
+
+        // Fallback: AVAudioRecorder (legacy, well-tested path)
+        let legacyRecorder = CustomMediaRecorder()
+        let recordingResult = legacyRecorder.startRecording(recordOptions: recordOptions)
+
+        if recordingResult.success {
+            customMediaRecorder = legacyRecorder
+            NSLog("VoiceRecorder: Recording started with CustomMediaRecorder (fallback)")
+            isInterrupted = false
+            wasInterruptedAndStopped = false
+            call.resolve(ResponseGenerator.successResponse())
+            return
+        }
+
+        customMediaRecorder = nil
+
+        // Build comprehensive error details from the fallback failure
+        // (include Engine failure info for diagnostics)
+        var errorDetails: [String: Any] = [
+            "requestedDirectory": directory ?? "DOCUMENTS",
+            "requestedSubDirectory": subDirectory ?? "none"
+        ]
+
+        if let recordingError = recordingResult.error {
+            errorDetails["stage"] = recordingError.stage
+            errorDetails["stageDetails"] = recordingError.details
+            errorDetails["stageError"] = recordingError.errorDescription ?? "Unknown error"
+        }
+
+        // Include Engine failure info for diagnostics
+        if let engineError = engineResult.error {
+            errorDetails["engineFailure"] = [
+                "stage": engineError.stage,
+                "error": engineError.errorDescription ?? "Unknown",
+                "details": engineError.details
+            ]
+        }
+
+        // Add basic document directory info for compatibility
+        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "unknown"
+        let isDocumentsWritable = FileManager.default.isWritableFile(atPath: documentsPath)
+        errorDetails["documentsPath"] = documentsPath
+        errorDetails["documentsWritable"] = isDocumentsWritable
+
+        let errorMessage = recordingResult.error?.errorDescription ?? "Recording setup failed"
+
+        rejectWithDiagnostics(call,
+                       Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                       errorMessage,
+                       errorDetails)
     }
 
     @objc func stopRecording(_ call: CAPPluginCall) {

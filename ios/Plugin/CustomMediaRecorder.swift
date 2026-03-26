@@ -28,7 +28,7 @@ struct RecordingResult {
     }
 }
 
-class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
+class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate {
 
     var options: RecordOptions!
     private var recordingSession: AVAudioSession!
@@ -176,13 +176,23 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                     }
 
                     try recordingSession.setActive(true)
+
+                    // Explicitly set preferred input to built-in microphone.
+                    // With .mixWithOthers, iOS may not automatically route the mic
+                    // (diagnostic data shows currentInputs: [] despite availableInputs: ["MicrophoneBuiltIn"]).
+                    if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMicrophone }) {
+                        try? recordingSession.setPreferredInput(builtInMic)
+                        NSLog("CustomMediaRecorder: setPreferredInput to %@ (attempt %d)", builtInMic.portName, activationAttempt)
+                    }
+
                     activationSuccess = true
-                    NSLog("CustomMediaRecorder: setActive succeeded on attempt %d/%d%@, category=%@, inputs=%@, outputs=%@",
+                    NSLog("CustomMediaRecorder: setActive succeeded on attempt %d/%d%@, category=%@, inputs=%@, outputs=%@, preferredInput=%@",
                           activationAttempt, maxActivationAttempts,
                           activatedWithMixing ? " (with .mixWithOthers fallback)" : "",
                           recordingSession.category.rawValue,
                           recordingSession.currentRoute.inputs.map { $0.portType.rawValue }.description,
-                          recordingSession.currentRoute.outputs.map { $0.portType.rawValue }.description)
+                          recordingSession.currentRoute.outputs.map { $0.portType.rawValue }.description,
+                          recordingSession.preferredInput?.portName ?? "none")
                     break
 
                 } catch {
@@ -229,7 +239,9 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
             // Stabilisation delay – gives the audio session time to settle
             // after category/route changes before we attempt to record.
             // iPad needs a longer delay due to WKWebView audio session conflicts.
-            let stabilisationDelay: TimeInterval = isIPad ? 0.5 : 0.15
+            // When .mixWithOthers was used, allow extra time for mic routing to settle
+            // after setPreferredInput.
+            let stabilisationDelay: TimeInterval = isIPad ? (activatedWithMixing ? 1.0 : 0.5) : 0.15
             Thread.sleep(forTimeInterval: stabilisationDelay)
 
             let outputDir = getDirectoryToSaveAudioFile()
@@ -317,11 +329,24 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                     try recordingSession.setCategory(.ambient)
                     Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
 
-                    // Use pure .playAndRecord without .mixWithOthers for retry
-                    try recordingSession.setCategory(.playAndRecord)
+                    // Use .mixWithOthers if session activation required it (WebView audio coexistence).
+                    // Previous approach (commit 887130c) always used pure .playAndRecord here which
+                    // caused error 560557684 when WebView audio was playing.
+                    // The record()=false issue with .mixWithOthers is addressed by setPreferredInput
+                    // which ensures mic routing (currentInputs was empty without it).
+                    if activatedWithMixing {
+                        try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
+                    } else {
+                        try recordingSession.setCategory(.playAndRecord)
+                    }
                     try recordingSession.setActive(true)
 
-                    Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.15)
+                    // Explicitly route mic input after re-activation
+                    if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMicrophone }) {
+                        try? recordingSession.setPreferredInput(builtInMic)
+                    }
+
+                    Thread.sleep(forTimeInterval: isIPad ? (activatedWithMixing ? 1.0 : 0.5) : 0.15)
 
                     // Recreate AVAudioRecorder with a fresh file path
                     audioFilePath = outputDir.appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
@@ -345,8 +370,10 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                     "inputsAfterRetries": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
                     "outputsAfterRetries": recordingSession.currentRoute.outputs.map { $0.portType.rawValue },
                     "availableInputsAfterRetries": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? [],
-                    "stabilisationDelay": isIPad ? 0.5 : 0.15,
+                    "stabilisationDelay": isIPad ? (activatedWithMixing ? 1.0 : 0.5) : 0.15,
                     "activatedWithMixing": activatedWithMixing,
+                    "preferredInput": recordingSession.preferredInput?.portName ?? "none",
+                    "recorderType": "avrecorder",
                     "activationErrors": activationErrors,
                     "needsCleanup": needsCleanup,
                     "isOtherAudioPlayingAtStart": recordingSession.isOtherAudioPlaying,
@@ -371,9 +398,11 @@ class CustomMediaRecorder: NSObject, AVAudioRecorderDelegate {
                 "domain": (error as NSError).domain,
                 "code": (error as NSError).code,
                 "userInfo": (error as NSError).userInfo,
+                "recorderType": "avrecorder",
                 "activatedWithMixing": activatedWithMixing,
                 "activationErrors": activationErrors,
                 "needsCleanup": needsCleanup,
+                "preferredInput": recordingSession?.preferredInput?.portName ?? "none",
                 "originalCategory": originalRecordingSessionCategory?.rawValue ?? "nil",
                 "isOtherAudioPlaying": recordingSession?.isOtherAudioPlaying ?? false,
                 "availableInputs": recordingSession?.availableInputs?.map { $0.portType.rawValue } ?? [],
