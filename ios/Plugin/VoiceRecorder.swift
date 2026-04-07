@@ -44,110 +44,109 @@ public class VoiceRecorder: CAPPlugin {
             return
         }
 
-        // Check audio session state before creating recorder
-        let audioSession = AVAudioSession.sharedInstance()
-
-        // Note: isOtherAudioPlaying is NOT a blocking condition.
-        // WebView presentations with audio+video run during recording — iOS reports
-        // them as "other audio playing" but recording must proceed alongside them.
-        // CustomMediaRecorder handles this via .mixWithOthers fallback strategy.
-        if audioSession.isOtherAudioPlaying {
-            NSLog("VoiceRecorder: Other audio is playing (category: %@), proceeding - likely WebView presentation",
-                  audioSession.category.rawValue)
-            // Cleanup orphaned .playAndRecord session if detected
-            if audioSession.category == .playAndRecord {
-                NSLog("VoiceRecorder: Detected orphaned .playAndRecord with otherAudioPlaying, cleaning up")
-                try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
-                try? audioSession.setCategory(.ambient)
-                Thread.sleep(forTimeInterval: 0.2)
-            }
-        }
-
-        if audioSession.availableInputs?.isEmpty == true {
-            rejectWithDiagnostics(call,
-                                 Messages.CANNOT_RECORD_ON_THIS_PHONE,
-                                 "No microphone input available",
-                                 ["availableInputs": 0])
-            return
-        }
-
-        // Setup audio session interruption handling
-        setupAudioSessionInterruptionHandling()
-
         let directory: String? = call.getString("directory")
         let subDirectory: String? = call.getString("subDirectory")
-        let recordOptions = RecordOptions(directory: directory, subDirectory: subDirectory)
 
-        // Try AVAudioEngine first (resilient to record()=false with .mixWithOthers on iPad),
-        // fall back to AVAudioRecorder if Engine fails.
-        let engineRecorder = AudioEngineRecorder()
-        let engineResult = engineRecorder.startRecording(recordOptions: recordOptions)
+        // Heavy work (audio session activation, Thread.sleep retries) runs off main thread
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else {
+                call.reject(Messages.CANNOT_RECORD_ON_THIS_PHONE)
+                return
+            }
 
-        if engineResult.success {
-            customMediaRecorder = engineRecorder
-            NSLog("VoiceRecorder: Recording started with AudioEngineRecorder")
-            isInterrupted = false
-            wasInterruptedAndStopped = false
-            call.resolve(ResponseGenerator.successResponse())
-            return
-        }
+            // Check audio session state before creating recorder
+            let audioSession = AVAudioSession.sharedInstance()
 
-        NSLog("VoiceRecorder: AudioEngine failed (%@), falling back to AVAudioRecorder",
-              engineResult.error?.errorDescription ?? "unknown")
+            if audioSession.isOtherAudioPlaying {
+                NSLog("VoiceRecorder: Other audio is playing (category: %@), proceeding - likely WebView presentation",
+                      audioSession.category.rawValue)
+                if audioSession.category == .playAndRecord {
+                    NSLog("VoiceRecorder: Detected orphaned .playAndRecord with otherAudioPlaying, cleaning up")
+                    try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+                    try? audioSession.setCategory(.ambient)
+                    Thread.sleep(forTimeInterval: 0.2)
+                }
+            }
 
-        // Fallback: AVAudioRecorder (legacy, well-tested path)
-        let legacyRecorder = CustomMediaRecorder()
-        let recordingResult = legacyRecorder.startRecording(recordOptions: recordOptions)
+            if audioSession.availableInputs?.isEmpty == true {
+                self.rejectWithDiagnostics(call,
+                                     Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                                     "No microphone input available",
+                                     ["availableInputs": 0])
+                return
+            }
 
-        if recordingResult.success {
-            customMediaRecorder = legacyRecorder
-            NSLog("VoiceRecorder: Recording started with CustomMediaRecorder (fallback)")
-            isInterrupted = false
-            wasInterruptedAndStopped = false
-            call.resolve(ResponseGenerator.successResponse())
-            return
-        }
+            // Setup audio session interruption handling
+            self.setupAudioSessionInterruptionHandling()
 
-        customMediaRecorder = nil
+            let recordOptions = RecordOptions(directory: directory, subDirectory: subDirectory)
 
-        // Build comprehensive error details from the fallback failure
-        // (include Engine failure info for diagnostics)
-        var errorDetails: [String: Any] = [
-            "requestedDirectory": directory ?? "DOCUMENTS",
-            "requestedSubDirectory": subDirectory ?? "none"
-        ]
+            // Try AVAudioEngine first, fall back to AVAudioRecorder if Engine fails.
+            let engineRecorder = AudioEngineRecorder()
+            let engineResult = engineRecorder.startRecording(recordOptions: recordOptions)
 
-        if let recordingError = recordingResult.error {
-            errorDetails["stage"] = recordingError.stage
-            errorDetails["stageDetails"] = recordingError.details
-            errorDetails["stageError"] = recordingError.errorDescription ?? "Unknown error"
-        }
+            if engineResult.success {
+                self.customMediaRecorder = engineRecorder
+                NSLog("VoiceRecorder: Recording started with AudioEngineRecorder")
+                self.isInterrupted = false
+                self.wasInterruptedAndStopped = false
+                call.resolve(["value": true, "engine": "audio_engine"])
+                return
+            }
 
-        // Include Engine failure info for diagnostics
-        if let engineError = engineResult.error {
-            errorDetails["engineFailure"] = [
-                "stage": engineError.stage,
-                "error": engineError.errorDescription ?? "Unknown",
-                "details": engineError.details
+            NSLog("VoiceRecorder: AudioEngine failed (%@), falling back to AVAudioRecorder",
+                  engineResult.error?.errorDescription ?? "unknown")
+
+            // Fallback: AVAudioRecorder (legacy, well-tested path)
+            let legacyRecorder = CustomMediaRecorder()
+            let recordingResult = legacyRecorder.startRecording(recordOptions: recordOptions)
+
+            if recordingResult.success {
+                self.customMediaRecorder = legacyRecorder
+                NSLog("VoiceRecorder: Recording started with CustomMediaRecorder (fallback)")
+                self.isInterrupted = false
+                self.wasInterruptedAndStopped = false
+                call.resolve(["value": true, "engine": "legacy"])
+                return
+            }
+
+            self.customMediaRecorder = nil
+
+            var errorDetails: [String: Any] = [
+                "requestedDirectory": directory ?? "DOCUMENTS",
+                "requestedSubDirectory": subDirectory ?? "none"
             ]
+
+            if let recordingError = recordingResult.error {
+                errorDetails["stage"] = recordingError.stage
+                errorDetails["stageDetails"] = recordingError.details
+                errorDetails["stageError"] = recordingError.errorDescription ?? "Unknown error"
+            }
+
+            if let engineError = engineResult.error {
+                errorDetails["engineFailure"] = [
+                    "stage": engineError.stage,
+                    "error": engineError.errorDescription ?? "Unknown",
+                    "details": engineError.details
+                ]
+            }
+
+            let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "unknown"
+            let isDocumentsWritable = FileManager.default.isWritableFile(atPath: documentsPath)
+            errorDetails["documentsPath"] = documentsPath
+            errorDetails["documentsWritable"] = isDocumentsWritable
+
+            let errorMessage = recordingResult.error?.errorDescription ?? "Recording setup failed"
+
+            self.rejectWithDiagnostics(call,
+                           Messages.CANNOT_RECORD_ON_THIS_PHONE,
+                           errorMessage,
+                           errorDetails)
         }
-
-        // Add basic document directory info for compatibility
-        let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? "unknown"
-        let isDocumentsWritable = FileManager.default.isWritableFile(atPath: documentsPath)
-        errorDetails["documentsPath"] = documentsPath
-        errorDetails["documentsWritable"] = isDocumentsWritable
-
-        let errorMessage = recordingResult.error?.errorDescription ?? "Recording setup failed"
-
-        rejectWithDiagnostics(call,
-                       Messages.CANNOT_RECORD_ON_THIS_PHONE,
-                       errorMessage,
-                       errorDetails)
     }
 
     @objc func stopRecording(_ call: CAPPluginCall) {
-        if customMediaRecorder == nil {
+        guard let recorder = customMediaRecorder else {
             call.reject(Messages.RECORDING_HAS_NOT_STARTED)
             return
         }
@@ -155,56 +154,83 @@ public class VoiceRecorder: CAPPlugin {
         // Remove audio session interruption observer
         removeAudioSessionInterruptionHandling()
 
-        customMediaRecorder?.stopRecording()
+        NSLog("VoiceRecorder: stopRecording [1] dispatching to background")
 
-        guard let audioFileUrl = customMediaRecorder?.getOutputFile(),
-              FileManager.default.fileExists(atPath: audioFileUrl.path) else {
-            NSLog("VoiceRecorder: Recording file does not exist at expected path: %@",
-                  customMediaRecorder?.getOutputFile()?.path ?? "nil")
-            customMediaRecorder = nil
-            call.reject(Messages.FAILED_TO_FETCH_RECORDING)
-            return
-        }
+        // Heavy work (PCM→AAC conversion, base64 encoding) must run off the main thread
+        // to avoid freezing the UI.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else {
+                NSLog("VoiceRecorder: stopRecording [ERR] self is nil")
+                call.reject(Messages.FAILED_TO_FETCH_RECORDING)
+                return
+            }
 
-        var path = audioFileUrl.lastPathComponent
-        if let subDirectory = customMediaRecorder?.options?.subDirectory {
-            path = subDirectory + "/" + path
-        }
+            NSLog("VoiceRecorder: stopRecording [2] calling recorder.stopRecording()")
+            recorder.stopRecording()
+            NSLog("VoiceRecorder: stopRecording [3] recorder.stopRecording() done")
 
-        // Build diagnostics for the app layer
-        var diagnostics: [String: Any] = [:]
-        if let attrs = try? FileManager.default.attributesOfItem(atPath: audioFileUrl.path),
-           let size = attrs[.size] as? UInt64 {
-            diagnostics["fileSize"] = size
-        }
+            guard let audioFileUrl = recorder.getOutputFile(),
+                  FileManager.default.fileExists(atPath: audioFileUrl.path) else {
+                NSLog("VoiceRecorder: Recording file does not exist at expected path: %@",
+                      recorder.getOutputFile()?.path ?? "nil")
+                self.customMediaRecorder = nil
+                call.reject(Messages.FAILED_TO_FETCH_RECORDING)
+                return
+            }
+            NSLog("VoiceRecorder: stopRecording [4] outputFile=%@", audioFileUrl.path)
 
-        if let engineRecorder = customMediaRecorder as? AudioEngineRecorder {
-            diagnostics["recorderType"] = "engine"
-            diagnostics["conversion"] = engineRecorder.lastConversionResult.toDictionary()
-        } else {
-            diagnostics["recorderType"] = "legacy"
-        }
+            var path = audioFileUrl.lastPathComponent
+            if let subDirectory = recorder.options?.subDirectory {
+                path = subDirectory + "/" + path
+            }
 
-        let sendDataAsBase64 = customMediaRecorder?.options?.directory == nil
-        let recordData = RecordData(
-            recordDataBase64: sendDataAsBase64 ? readFileAsBase64(audioFileUrl) : nil,
-            mimeType: "audio/aac",
-            msDuration: getMsDurationOfAudioFile(audioFileUrl),
-            path: sendDataAsBase64 ? nil : path,
-            diagnostics: diagnostics
-        )
+            // Build diagnostics for the app layer
+            var diagnostics: [String: Any] = [:]
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: audioFileUrl.path),
+               let size = attrs[.size] as? UInt64 {
+                diagnostics["fileSize"] = size
+                NSLog("VoiceRecorder: stopRecording [5] fileSize=%llu", size)
+            }
 
-        // If we were interrupted, mark that we stopped due to interruption
-        if isInterrupted {
-            wasInterruptedAndStopped = true
-        }
+            if let engineRecorder = recorder as? AudioEngineRecorder {
+                diagnostics["recorderType"] = "engine"
+                diagnostics["conversion"] = engineRecorder.lastConversionResult.toDictionary()
+            } else {
+                diagnostics["recorderType"] = "legacy"
+            }
 
-        customMediaRecorder = nil
-        isInterrupted = false
-        if (sendDataAsBase64 && recordData.recordDataBase64 == nil) || recordData.msDuration < 0 {
-            call.reject(Messages.EMPTY_RECORDING)
-        } else {
-            call.resolve(ResponseGenerator.dataResponse(recordData.toDictionary()))
+            let sendDataAsBase64 = recorder.options?.directory == nil
+            NSLog("VoiceRecorder: stopRecording [6] sendDataAsBase64=%@, directory=%@",
+                  sendDataAsBase64 ? "true" : "false",
+                  recorder.options?.directory ?? "nil")
+
+            NSLog("VoiceRecorder: stopRecording [7] reading base64/duration...")
+            let recordData = RecordData(
+                recordDataBase64: sendDataAsBase64 ? self.readFileAsBase64(audioFileUrl) : nil,
+                mimeType: "audio/aac",
+                msDuration: self.getMsDurationOfAudioFile(audioFileUrl),
+                path: sendDataAsBase64 ? nil : path,
+                diagnostics: diagnostics
+            )
+            NSLog("VoiceRecorder: stopRecording [8] recordData ready, msDuration=%d, base64len=%d",
+                  recordData.msDuration,
+                  recordData.recordDataBase64?.count ?? 0)
+
+            // If we were interrupted, mark that we stopped due to interruption
+            if self.isInterrupted {
+                self.wasInterruptedAndStopped = true
+            }
+
+            self.customMediaRecorder = nil
+            self.isInterrupted = false
+            if (sendDataAsBase64 && recordData.recordDataBase64 == nil) || recordData.msDuration < 0 {
+                NSLog("VoiceRecorder: stopRecording [9] rejecting - empty recording")
+                call.reject(Messages.EMPTY_RECORDING)
+            } else {
+                NSLog("VoiceRecorder: stopRecording [9] resolving with data")
+                call.resolve(ResponseGenerator.dataResponse(recordData.toDictionary()))
+                NSLog("VoiceRecorder: stopRecording [10] resolve done")
+            }
         }
     }
 
@@ -246,7 +272,9 @@ public class VoiceRecorder: CAPPlugin {
             let fileData = try Data.init(contentsOf: filePath!)
             let fileStream = fileData.base64EncodedString(options: NSData.Base64EncodingOptions.init(rawValue: 0))
             return fileStream
-        } catch {}
+        } catch {
+            NSLog("VoiceRecorder: readFileAsBase64 failed: %@", error.localizedDescription)
+        }
 
         return nil
     }

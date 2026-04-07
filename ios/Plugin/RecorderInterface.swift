@@ -6,6 +6,6 @@ protocol RecorderInterface: AnyObject {
     func stopRecording()
     func pauseRecording() -> Bool
     func resumeRecording() -> Bool
-    func getOutputFile() -> URL
+    func getOutputFile() -> URL?
     func getCurrentStatus() -> CurrentRecordingStatus
 }

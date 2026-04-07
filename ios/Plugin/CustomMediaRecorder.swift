@@ -176,7 +176,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
                     // Explicitly set preferred input to built-in microphone.
                     // With .mixWithOthers, iOS may not automatically route the mic
                     // (diagnostic data shows currentInputs: [] despite availableInputs: ["MicrophoneBuiltIn"]).
-                    if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMicrophone }) {
+                    if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
                         try? recordingSession.setPreferredInput(builtInMic)
                         NSLog("CustomMediaRecorder: setPreferredInput to %@ (attempt %d)", builtInMic.portName, activationAttempt)
                     }
@@ -211,6 +211,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
             }
 
             if !activationSuccess {
+                cleanupAfterFailedStart()
                 return RecordingResult.failure(
                     stage: "session_activation",
                     details: [
@@ -247,6 +248,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
             let parentDir = audioFilePath.deletingLastPathComponent()
             let parentDirWritable = FileManager.default.isWritableFile(atPath: parentDir.path)
             if !parentDirWritable {
+                cleanupAfterFailedStart()
                 let filePathDetails: [String: Any] = [
                     "audioFilePath": audioFilePath.path,
                     "parentDir": parentDir.path,
@@ -264,6 +266,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
             audioRecorder.delegate = self
 
             if !audioRecorder.prepareToRecord() {
+                cleanupAfterFailedStart()
                 let recorderDetails: [String: Any] = [
                     "isRecording": audioRecorder.isRecording,
                     "format": audioRecorder.format.description,
@@ -338,7 +341,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
                     try recordingSession.setActive(true)
 
                     // Explicitly route mic input after re-activation
-                    if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMicrophone }) {
+                    if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
                         try? recordingSession.setPreferredInput(builtInMic)
                     }
 
@@ -356,6 +359,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
             }
 
             if !recordResult {
+                cleanupAfterFailedStart()
                 let finalRecorderDetails: [String: Any] = [
                     "isRecording": audioRecorder?.isRecording ?? false,
                     "currentTime": audioRecorder?.currentTime ?? -1,
@@ -388,6 +392,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
             return RecordingResult.success()
 
         } catch let error {
+            cleanupAfterFailedStart()
             let catchDeviceInfo = getDeviceInfo()
             let errorDetails: [String: Any] = [
                 "errorDescription": error.localizedDescription,
@@ -416,6 +421,24 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
         }
     }
 
+    private func cleanupAfterFailedStart() {
+        NSLog("CustomMediaRecorder: cleanupAfterFailedStart")
+        audioRecorder?.stop()
+        audioRecorder = nil
+
+        do {
+            try recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
+        } catch {
+            NSLog("CustomMediaRecorder: cleanup setActive(false) failed: %@", error.localizedDescription)
+        }
+        if let orig = originalRecordingSessionCategory {
+            try? recordingSession?.setCategory(orig)
+        }
+        originalRecordingSessionCategory = nil
+        recordingSession = nil
+        status = CurrentRecordingStatus.NONE
+    }
+
     func stopRecording() {
         audioRecorder?.stop()
 
@@ -441,7 +464,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
         status = CurrentRecordingStatus.NONE
     }
 
-    func getOutputFile() -> URL {
+    func getOutputFile() -> URL? {
         return audioFilePath
     }
 
@@ -461,7 +484,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
 
     func pauseRecording() -> Bool {
         if status == CurrentRecordingStatus.RECORDING {
-            audioRecorder.pause()
+            audioRecorder?.pause()
             status = CurrentRecordingStatus.PAUSED
             return true
         } else {
@@ -471,7 +494,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
 
     func resumeRecording() -> Bool {
         if status == CurrentRecordingStatus.PAUSED {
-            audioRecorder.record()
+            audioRecorder?.record()
             status = CurrentRecordingStatus.RECORDING
             return true
         } else {
