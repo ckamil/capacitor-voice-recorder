@@ -9,6 +9,7 @@ export interface RecordingData {
     msDuration: number;
     mimeType: string;
     path?: string;
+    diagnostics?: Record<string, any>;
   };
 }
 
