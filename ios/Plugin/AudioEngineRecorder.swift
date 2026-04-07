@@ -2,9 +2,30 @@ import Foundation
 import AVFoundation
 import UIKit
 
+enum ConversionResult {
+    case success(fileSize: UInt64)
+    case fallbackToPCMCopy(reason: String, fileSize: UInt64)
+    case failed(reason: String)
+    case notAttempted
+
+    func toDictionary() -> [String: Any] {
+        switch self {
+        case .success(let fileSize):
+            return ["status": "success", "fileSize": fileSize]
+        case .fallbackToPCMCopy(let reason, let fileSize):
+            return ["status": "fallback_pcm_copy", "reason": reason, "fileSize": fileSize]
+        case .failed(let reason):
+            return ["status": "failed", "reason": reason]
+        case .notAttempted:
+            return ["status": "not_attempted"]
+        }
+    }
+}
+
 class AudioEngineRecorder: NSObject, RecorderInterface {
 
     var options: RecordOptions!
+    var lastConversionResult: ConversionResult = .notAttempted
     private var audioEngine: AVAudioEngine!
     private var pcmFile: AVAudioFile!
     private var pcmFileURL: URL!
@@ -15,19 +36,15 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     private var isPaused = false
     private let writeQueue = DispatchQueue(label: "com.capacitor.voicerecorder.enginewriter")
 
-    private func getDirectoryToSaveAudioFile() -> URL {
+    private func getDirectoryToSaveAudioFile() throws -> URL {
         if let directory = getDirectory(directory: options.directory),
            var outputDirURL = FileManager.default.urls(for: directory, in: .userDomainMask).first {
             if let subDirectory = options.subDirectory?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
                 options.setSubDirectory(to: subDirectory)
                 outputDirURL = outputDirURL.appendingPathComponent(subDirectory, isDirectory: true)
 
-                do {
-                    if !FileManager.default.fileExists(atPath: outputDirURL.path) {
-                        try FileManager.default.createDirectory(at: outputDirURL, withIntermediateDirectories: true)
-                    }
-                } catch {
-                    NSLog("AudioEngineRecorder: Error creating directory: %@", error.localizedDescription)
+                if !FileManager.default.fileExists(atPath: outputDirURL.path) {
+                    try FileManager.default.createDirectory(at: outputDirURL, withIntermediateDirectories: true)
                 }
             }
 
@@ -157,7 +174,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             Thread.sleep(forTimeInterval: stabilisationDelay)
 
             // Prepare output directory and file paths
-            let outputDir = getDirectoryToSaveAudioFile()
+            let outputDir = try getDirectoryToSaveAudioFile()
             let timestamp = Int(Date().timeIntervalSince1970 * 1000)
             pcmFileURL = outputDir.appendingPathComponent("recording-\(timestamp)-pcm.wav")
             aacFileURL = outputDir.appendingPathComponent("recording-\(timestamp).aac")
@@ -246,12 +263,32 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             engine.stop()
         }
 
-        // Finalize PCM file
-        pcmFile = nil
+        // Wait for all pending writes to complete, then finalize PCM file.
+        // pcmFile is accessed on writeQueue (tap callback), so it must be
+        // set to nil on the same queue to avoid a race condition.
+        writeQueue.sync {
+            self.pcmFile = nil
+        }
 
         // Convert PCM to AAC
+        lastConversionResult = .notAttempted
         if let pcmURL = pcmFileURL, FileManager.default.fileExists(atPath: pcmURL.path) {
-            convertPCMtoAAC(inputURL: pcmURL, outputURL: aacFileURL)
+            lastConversionResult = convertPCMtoAAC(inputURL: pcmURL, outputURL: aacFileURL)
+
+            // If conversion failed entirely, attempt last-resort PCM copy
+            if case .failed = lastConversionResult {
+                if !FileManager.default.fileExists(atPath: aacFileURL.path) {
+                    if let _ = try? FileManager.default.copyItem(at: pcmURL, to: aacFileURL),
+                       let attrs = try? FileManager.default.attributesOfItem(atPath: aacFileURL.path),
+                       let size = attrs[.size] as? UInt64 {
+                        lastConversionResult = .fallbackToPCMCopy(reason: "last_resort_copy", fileSize: size)
+                        NSLog("AudioEngineRecorder: Last resort PCM copy succeeded (%llu bytes)", size)
+                    } else {
+                        NSLog("AudioEngineRecorder: Last resort PCM copy also failed")
+                    }
+                }
+            }
+
             // Clean up temp PCM file
             try? FileManager.default.removeItem(at: pcmURL)
         }
@@ -306,7 +343,20 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
     // MARK: - PCM to AAC Conversion
 
-    private func convertPCMtoAAC(inputURL: URL, outputURL: URL) {
+    private func getFileSize(_ url: URL) -> UInt64 {
+        return (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0
+    }
+
+    private func fallbackCopyPCM(from inputURL: URL, to outputURL: URL, reason: String) -> ConversionResult {
+        NSLog("AudioEngineRecorder: Falling back to PCM copy (%@)", reason)
+        if let _ = try? FileManager.default.copyItem(at: inputURL, to: outputURL) {
+            let size = getFileSize(outputURL)
+            return .fallbackToPCMCopy(reason: reason, fileSize: size)
+        }
+        return .failed(reason: reason)
+    }
+
+    private func convertPCMtoAAC(inputURL: URL, outputURL: URL) -> ConversionResult {
         do {
             let inputFile = try AVAudioFile(forReading: inputURL)
             let inputFormat = inputFile.processingFormat
@@ -314,13 +364,13 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
             guard frameCount > 0 else {
                 NSLog("AudioEngineRecorder: No audio frames to convert")
-                return
+                return .failed(reason: "no_audio_frames")
             }
 
             // Read all PCM data
             guard let pcmBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: frameCount) else {
                 NSLog("AudioEngineRecorder: Failed to create PCM buffer for conversion")
-                return
+                return .failed(reason: "pcm_buffer_creation_failed")
             }
             try inputFile.read(into: pcmBuffer)
 
@@ -339,13 +389,13 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
             guard let outputFormat = AVAudioFormat(streamDescription: &outputDescription) else {
                 NSLog("AudioEngineRecorder: Failed to create AAC output format")
-                return
+                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "aac_format_creation_failed")
             }
 
             // Use AVAudioConverter for PCM → AAC
             guard let converter = AVAudioConverter(from: inputFormat, to: outputFormat) else {
                 NSLog("AudioEngineRecorder: Failed to create audio converter")
-                return
+                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "converter_creation_failed")
             }
             converter.bitRate = 96000
 
@@ -355,7 +405,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
                                                              packetCapacity: 1,
                                                              maximumPacketSize: converter.maximumOutputPacketSize) else {
                 NSLog("AudioEngineRecorder: Failed to create compressed buffer")
-                return
+                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "compressed_buffer_failed")
             }
 
             // Create output file (ExtAudioFile via AudioToolbox)
@@ -371,9 +421,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
             guard status == noErr, let outputFile = outputFileRef else {
                 NSLog("AudioEngineRecorder: Failed to create output AAC file: %d", status)
-                // Fallback: keep the PCM file and rename it
-                try? FileManager.default.copyItem(at: inputURL, to: outputURL)
-                return
+                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "output_file_creation_failed_\(status)")
             }
 
             // Set client format to match input
@@ -388,8 +436,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             if status != noErr {
                 NSLog("AudioEngineRecorder: Failed to set client format: %d", status)
                 ExtAudioFileDispose(outputFile)
-                try? FileManager.default.copyItem(at: inputURL, to: outputURL)
-                return
+                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "client_format_failed_\(status)")
             }
 
             // Write PCM data — ExtAudioFile handles the encoding
@@ -402,13 +449,15 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
             ExtAudioFileDispose(outputFile)
 
-            NSLog("AudioEngineRecorder: PCM→AAC conversion complete (%d frames, %.1fs)",
-                  frameCount, Double(frameCount) / inputFormat.sampleRate)
+            let outputSize = getFileSize(outputURL)
+            NSLog("AudioEngineRecorder: PCM→AAC conversion complete (%d frames, %.1fs, %llu bytes)",
+                  frameCount, Double(frameCount) / inputFormat.sampleRate, outputSize)
+
+            return .success(fileSize: outputSize)
 
         } catch {
             NSLog("AudioEngineRecorder: Conversion failed: %@", error.localizedDescription)
-            // Fallback: copy PCM as-is
-            try? FileManager.default.copyItem(at: inputURL, to: outputURL)
+            return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "exception_\(error.localizedDescription)")
         }
     }
 }

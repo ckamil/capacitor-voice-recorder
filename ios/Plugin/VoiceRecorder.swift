@@ -157,16 +157,32 @@ public class VoiceRecorder: CAPPlugin {
 
         customMediaRecorder?.stopRecording()
 
-        let audioFileUrl = customMediaRecorder?.getOutputFile()
-        if audioFileUrl == nil {
+        guard let audioFileUrl = customMediaRecorder?.getOutputFile(),
+              FileManager.default.fileExists(atPath: audioFileUrl.path) else {
+            NSLog("VoiceRecorder: Recording file does not exist at expected path: %@",
+                  customMediaRecorder?.getOutputFile()?.path ?? "nil")
             customMediaRecorder = nil
             call.reject(Messages.FAILED_TO_FETCH_RECORDING)
             return
         }
 
-        var path = audioFileUrl!.lastPathComponent
+        var path = audioFileUrl.lastPathComponent
         if let subDirectory = customMediaRecorder?.options?.subDirectory {
             path = subDirectory + "/" + path
+        }
+
+        // Build diagnostics for the app layer
+        var diagnostics: [String: Any] = [:]
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: audioFileUrl.path),
+           let size = attrs[.size] as? UInt64 {
+            diagnostics["fileSize"] = size
+        }
+
+        if let engineRecorder = customMediaRecorder as? AudioEngineRecorder {
+            diagnostics["recorderType"] = "engine"
+            diagnostics["conversion"] = engineRecorder.lastConversionResult.toDictionary()
+        } else {
+            diagnostics["recorderType"] = "legacy"
         }
 
         let sendDataAsBase64 = customMediaRecorder?.options?.directory == nil
@@ -174,7 +190,8 @@ public class VoiceRecorder: CAPPlugin {
             recordDataBase64: sendDataAsBase64 ? readFileAsBase64(audioFileUrl) : nil,
             mimeType: "audio/aac",
             msDuration: getMsDurationOfAudioFile(audioFileUrl),
-            path: sendDataAsBase64 ? nil : path
+            path: sendDataAsBase64 ? nil : path,
+            diagnostics: diagnostics
         )
 
         // If we were interrupted, mark that we stopped due to interruption

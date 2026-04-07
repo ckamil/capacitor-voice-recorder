@@ -44,19 +44,15 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
         AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
     ]
 
-    private func getDirectoryToSaveAudioFile() -> URL {
+    private func getDirectoryToSaveAudioFile() throws -> URL {
         if let directory = getDirectory(directory: options.directory),
            var outputDirURL = FileManager.default.urls(for: directory, in: .userDomainMask).first {
             if let subDirectory = options.subDirectory?.trimmingCharacters(in: CharacterSet(charactersIn: "/")) {
                 options.setSubDirectory(to: subDirectory)
                 outputDirURL = outputDirURL.appendingPathComponent(subDirectory, isDirectory: true)
 
-                do {
-                    if !FileManager.default.fileExists(atPath: outputDirURL.path) {
-                        try FileManager.default.createDirectory(at: outputDirURL, withIntermediateDirectories: true)
-                    }
-                } catch {
-                    print("Error creating directory: \(error)")
+                if !FileManager.default.fileExists(atPath: outputDirURL.path) {
+                    try FileManager.default.createDirectory(at: outputDirURL, withIntermediateDirectories: true)
                 }
             }
 
@@ -244,7 +240,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
             let stabilisationDelay: TimeInterval = isIPad ? (activatedWithMixing ? 1.0 : 0.5) : 0.15
             Thread.sleep(forTimeInterval: stabilisationDelay)
 
-            let outputDir = getDirectoryToSaveAudioFile()
+            let outputDir = try getDirectoryToSaveAudioFile()
             audioFilePath = outputDir.appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
 
             // Check file path accessibility
