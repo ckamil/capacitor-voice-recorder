@@ -152,21 +152,63 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
                 }
             }
 
+            // Nuclear reset: if all standard attempts failed, try aggressive session reset.
+            // Uses .soloAmbient to force-release all audio session conflicts (including WebView),
+            // then re-establishes .playAndRecord after a long delay.
+            if !activationSuccess {
+                NSLog("AudioEngineRecorder: All %d standard attempts failed, trying nuclear reset", maxActivationAttempts)
+                do {
+                    try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
+                    try recordingSession.setCategory(.soloAmbient)
+                    Thread.sleep(forTimeInterval: 2.0)
+                    try recordingSession.setCategory(.playAndRecord, options: [.mixWithOthers, .allowBluetooth])
+                    try recordingSession.setActive(true)
+
+                    if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                        try? recordingSession.setPreferredInput(builtInMic)
+                    }
+
+                    // Verify input routing settled
+                    Thread.sleep(forTimeInterval: 0.5)
+                    if recordingSession.currentRoute.inputs.isEmpty {
+                        if let builtInMic = recordingSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                            try? recordingSession.setPreferredInput(builtInMic)
+                            Thread.sleep(forTimeInterval: 0.3)
+                        }
+                    }
+
+                    activationSuccess = true
+                    NSLog("AudioEngineRecorder: Nuclear reset succeeded, inputs=%@, preferredInput=%@",
+                          recordingSession.currentRoute.inputs.map { $0.portType.rawValue }.description,
+                          recordingSession.preferredInput?.portName ?? "none")
+                } catch {
+                    activationErrors.append([
+                        "attempt": maxActivationAttempts + 1,
+                        "type": "nuclear_reset",
+                        "error": error.localizedDescription,
+                        "domain": (error as NSError).domain,
+                        "code": (error as NSError).code
+                    ])
+                    NSLog("AudioEngineRecorder: Nuclear reset failed: %@", error.localizedDescription)
+                }
+            }
+
             if !activationSuccess {
                 cleanupAfterFailedStart()
                 return RecordingResult.failure(
                     stage: "session_activation",
                     details: [
                         "recorderType": "engine",
-                        "totalAttempts": maxActivationAttempts,
+                        "totalAttempts": maxActivationAttempts + 1,
                         "activationErrors": activationErrors,
                         "isIPad": isIPad,
                         "needsCleanup": needsCleanup,
+                        "nuclearResetAttempted": true,
                         "deviceModel": deviceInfo["model"] ?? "unknown",
                         "iosVersion": deviceInfo["systemVersion"] ?? "unknown",
                         "deviceIdiom": deviceInfo["idiom"] ?? "unknown"
                     ],
-                    errorDescription: "Session activation failed after \(maxActivationAttempts) attempts"
+                    errorDescription: "Session activation failed after \(maxActivationAttempts) attempts + nuclear reset"
                 )
             }
 

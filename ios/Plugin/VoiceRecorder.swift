@@ -110,6 +110,31 @@ public class VoiceRecorder: CAPPlugin {
                 return
             }
 
+            // Last resort: if both recorders failed on session_activation, try one more time
+            // after aggressive delay — gives WebView time to release audio session.
+            // The .soloAmbient → 3s delay → .playAndRecord sequence forces iOS to tear down
+            // all competing audio sessions before our final attempt.
+            if let engineError = engineResult.error, let legacyError = recordingResult.error,
+               engineError.stage == "session_activation" && legacyError.stage == "session_activation" {
+                NSLog("VoiceRecorder: Both recorders failed on session_activation, attempting last-resort retry after 3s delay")
+                let audioSession = AVAudioSession.sharedInstance()
+                try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+                try? audioSession.setCategory(.soloAmbient)
+                Thread.sleep(forTimeInterval: 3.0)
+
+                let lastResortRecorder = AudioEngineRecorder()
+                let lastResortResult = lastResortRecorder.startRecording(recordOptions: recordOptions)
+                if lastResortResult.success {
+                    self.customMediaRecorder = lastResortRecorder
+                    NSLog("VoiceRecorder: Last-resort AudioEngine succeeded after 3s delay")
+                    self.isInterrupted = false
+                    self.wasInterruptedAndStopped = false
+                    call.resolve(["value": true, "engine": "audio_engine_last_resort"])
+                    return
+                }
+                NSLog("VoiceRecorder: Last-resort also failed: %@", lastResortResult.error?.errorDescription ?? "unknown")
+            }
+
             self.customMediaRecorder = nil
 
             var errorDetails: [String: Any] = [
@@ -616,6 +641,13 @@ public class VoiceRecorder: CAPPlugin {
     private func rejectWithDiagnostics(_ call: CAPPluginCall, _ baseMessage: String, _ reason: String, _ details: [String: Any] = [:]) {
         let audioSession = AVAudioSession.sharedInstance()
 
+        // Device identification for diagnostics
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let modelCode = withUnsafePointer(to: &systemInfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+
         var diagnosticInfo: [String: Any] = [
             "baseError": baseMessage,
             "reason": reason,
@@ -624,7 +656,10 @@ public class VoiceRecorder: CAPPlugin {
             "audioSessionCategory": audioSession.category.rawValue,
             "isOtherAudioPlaying": audioSession.isOtherAudioPlaying,
             "availableInputs": audioSession.availableInputs?.count ?? 0,
-            "hasRecordPermission": doesUserGaveAudioRecordingPermission()
+            "hasRecordPermission": doesUserGaveAudioRecordingPermission(),
+            "deviceModel": modelCode,
+            "iosVersion": UIDevice.current.systemVersion,
+            "deviceIdiom": UIDevice.current.userInterfaceIdiom == .pad ? "pad" : "phone"
         ]
 
         // Add specific details if provided
