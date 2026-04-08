@@ -158,7 +158,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
                             NSLog("CustomMediaRecorder: setActive retry %d - hard reset", activationAttempt)
                             try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
                             try? recordingSession.setCategory(.ambient)
-                            Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
+                            Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.2)
                         }
                         try recordingSession.setCategory(.playAndRecord)
                     } else {
@@ -166,7 +166,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
                         NSLog("CustomMediaRecorder: setActive retry %d - falling back to .mixWithOthers", activationAttempt)
                         try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
                         try? recordingSession.setCategory(.ambient)
-                        Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
+                        Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.2)
                         try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
                         activatedWithMixing = true
                     }
@@ -238,7 +238,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
             // iPad needs a longer delay due to WKWebView audio session conflicts.
             // When .mixWithOthers was used, allow extra time for mic routing to settle
             // after setPreferredInput.
-            let stabilisationDelay: TimeInterval = isIPad ? (activatedWithMixing ? 1.0 : 0.5) : 0.15
+            let stabilisationDelay: TimeInterval = isIPad ? (activatedWithMixing ? 0.5 : 0.3) : 0.1
             Thread.sleep(forTimeInterval: stabilisationDelay)
 
             let outputDir = try getDirectoryToSaveAudioFile()
@@ -326,7 +326,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
 
                     try recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
                     try recordingSession.setCategory(.ambient)
-                    Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
+                    Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.2)
 
                     // Use .mixWithOthers if session activation required it (WebView audio coexistence).
                     // Previous approach (commit 887130c) always used pure .playAndRecord here which
@@ -345,7 +345,7 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
                         try? recordingSession.setPreferredInput(builtInMic)
                     }
 
-                    Thread.sleep(forTimeInterval: isIPad ? (activatedWithMixing ? 1.0 : 0.5) : 0.15)
+                    Thread.sleep(forTimeInterval: isIPad ? (activatedWithMixing ? 0.5 : 0.3) : 0.1)
 
                     // Recreate AVAudioRecorder with a fresh file path
                     audioFilePath = outputDir.appendingPathComponent("recording-\(Int(Date().timeIntervalSince1970 * 1000)).aac")
@@ -442,19 +442,33 @@ class CustomMediaRecorder: NSObject, RecorderInterface, AVAudioRecorderDelegate 
     func stopRecording() {
         audioRecorder?.stop()
 
-        // Attempt each cleanup step independently so a failure in one
-        // doesn't skip the others (root cause of orphaned session / Pattern A).
-        do {
-            try recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
-        } catch {
-            NSLog("CustomMediaRecorder: stopRecording setActive(false) failed: %@", error.localizedDescription)
+        // Retry deactivation to prevent orphaned .playAndRecord category
+        var deactivated = false
+        for attempt in 1...2 {
+            do {
+                try recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
+                deactivated = true
+                break
+            } catch {
+                NSLog("CustomMediaRecorder: stopRecording setActive(false) failed attempt %d: %@", attempt, error.localizedDescription)
+                if attempt < 2 {
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+            }
+        }
+        if !deactivated {
+            NSLog("CustomMediaRecorder: stopRecording WARNING - deactivation failed, forcing via .soloAmbient")
+            try? recordingSession?.setCategory(.soloAmbient)
+            Thread.sleep(forTimeInterval: 0.2)
+            try? recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
         }
 
         if let orig = originalRecordingSessionCategory {
             do {
                 try recordingSession?.setCategory(orig)
             } catch {
-                NSLog("CustomMediaRecorder: stopRecording setCategory failed: %@", error.localizedDescription)
+                NSLog("CustomMediaRecorder: stopRecording setCategory(%@) failed: %@", orig.rawValue, error.localizedDescription)
+                try? recordingSession?.setCategory(.ambient)
             }
         }
 

@@ -113,7 +113,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             // AVAudioEngine works well with .mixWithOthers — use it from the start.
             // Unlike AVAudioRecorder, installTap does not suffer from record()=false
             // when .mixWithOthers is active.
-            let maxActivationAttempts = 3
+            let maxActivationAttempts = 2
             var activationSuccess = false
 
             for attempt in 1...maxActivationAttempts {
@@ -122,7 +122,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
                         NSLog("AudioEngineRecorder: setActive retry %d - hard reset", attempt)
                         try? recordingSession.setActive(false, options: .notifyOthersOnDeactivation)
                         try? recordingSession.setCategory(.ambient)
-                        Thread.sleep(forTimeInterval: isIPad ? 0.8 : 0.3)
+                        Thread.sleep(forTimeInterval: isIPad ? 0.5 : 0.2)
                     }
 
                     try recordingSession.setCategory(.playAndRecord, options: .mixWithOthers)
@@ -171,7 +171,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             }
 
             // Stabilisation delay
-            let stabilisationDelay: TimeInterval = isIPad ? 1.0 : 0.15
+            let stabilisationDelay: TimeInterval = isIPad ? 0.5 : 0.1
             Thread.sleep(forTimeInterval: stabilisationDelay)
 
             // Prepare output directory and file paths
@@ -305,19 +305,34 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             NSLog("AudioEngineRecorder: stop [F] no PCM file to convert")
         }
 
-        // Restore audio session
+        // Restore audio session — retry deactivation to prevent orphaned .playAndRecord
         NSLog("AudioEngineRecorder: stop [H] restoring audio session")
-        do {
-            try recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
-        } catch {
-            NSLog("AudioEngineRecorder: stopRecording setActive(false) failed: %@", error.localizedDescription)
+        var deactivated = false
+        for attempt in 1...2 {
+            do {
+                try recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
+                deactivated = true
+                break
+            } catch {
+                NSLog("AudioEngineRecorder: stopRecording setActive(false) failed attempt %d: %@", attempt, error.localizedDescription)
+                if attempt < 2 {
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
+            }
+        }
+        if !deactivated {
+            NSLog("AudioEngineRecorder: stopRecording WARNING - deactivation failed, forcing via .soloAmbient")
+            try? recordingSession?.setCategory(.soloAmbient)
+            Thread.sleep(forTimeInterval: 0.2)
+            try? recordingSession?.setActive(false, options: .notifyOthersOnDeactivation)
         }
 
         if let orig = originalRecordingSessionCategory {
             do {
                 try recordingSession?.setCategory(orig)
             } catch {
-                NSLog("AudioEngineRecorder: stopRecording setCategory failed: %@", error.localizedDescription)
+                NSLog("AudioEngineRecorder: stopRecording setCategory(%@) failed: %@", orig.rawValue, error.localizedDescription)
+                try? recordingSession?.setCategory(.ambient)
             }
         }
 

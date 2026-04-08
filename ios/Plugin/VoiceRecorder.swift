@@ -97,6 +97,28 @@ public class VoiceRecorder: CAPPlugin {
             NSLog("VoiceRecorder: AudioEngine failed (%@), falling back to AVAudioRecorder",
                   engineResult.error?.errorDescription ?? "unknown")
 
+            // Nuclear reset: if Engine failed on session_activation, aggressively reset the
+            // audio session before Legacy gets its chance. Uses .soloAmbient to force-release
+            // all audio session conflicts, then leaves session clean for Legacy to configure.
+            if let engineError = engineResult.error, engineError.stage == "session_activation" {
+                NSLog("VoiceRecorder: Engine failed on session_activation, performing nuclear reset before Legacy attempt")
+                let audioSession = AVAudioSession.sharedInstance()
+                try? audioSession.setActive(false, options: .notifyOthersOnDeactivation)
+                try? audioSession.setCategory(.soloAmbient)
+                Thread.sleep(forTimeInterval: 1.0)
+                try? audioSession.setActive(false)
+                try? audioSession.setCategory(.ambient)
+
+                // Verify input routing settled after reset
+                Thread.sleep(forTimeInterval: 0.3)
+                if let builtInMic = audioSession.availableInputs?.first(where: { $0.portType == .builtInMic }) {
+                    try? audioSession.setPreferredInput(builtInMic)
+                }
+                NSLog("VoiceRecorder: Nuclear reset done, inputs=%@, availableInputs=%@",
+                      audioSession.currentRoute.inputs.map { $0.portType.rawValue }.description,
+                      audioSession.availableInputs?.map { $0.portType.rawValue }.description ?? "nil")
+            }
+
             // Fallback: AVAudioRecorder (legacy, well-tested path)
             let legacyRecorder = CustomMediaRecorder()
             let recordingResult = legacyRecorder.startRecording(recordOptions: recordOptions)
@@ -616,6 +638,13 @@ public class VoiceRecorder: CAPPlugin {
     private func rejectWithDiagnostics(_ call: CAPPluginCall, _ baseMessage: String, _ reason: String, _ details: [String: Any] = [:]) {
         let audioSession = AVAudioSession.sharedInstance()
 
+        // Device identification for diagnostics
+        var systemInfo = utsname()
+        uname(&systemInfo)
+        let modelCode = withUnsafePointer(to: &systemInfo.machine) {
+            $0.withMemoryRebound(to: CChar.self, capacity: 1) { String(cString: $0) }
+        }
+
         var diagnosticInfo: [String: Any] = [
             "baseError": baseMessage,
             "reason": reason,
@@ -624,7 +653,10 @@ public class VoiceRecorder: CAPPlugin {
             "audioSessionCategory": audioSession.category.rawValue,
             "isOtherAudioPlaying": audioSession.isOtherAudioPlaying,
             "availableInputs": audioSession.availableInputs?.count ?? 0,
-            "hasRecordPermission": doesUserGaveAudioRecordingPermission()
+            "hasRecordPermission": doesUserGaveAudioRecordingPermission(),
+            "deviceModel": modelCode,
+            "iosVersion": UIDevice.current.systemVersion,
+            "deviceIdiom": UIDevice.current.userInterfaceIdiom == .pad ? "pad" : "phone"
         ]
 
         // Add specific details if provided
