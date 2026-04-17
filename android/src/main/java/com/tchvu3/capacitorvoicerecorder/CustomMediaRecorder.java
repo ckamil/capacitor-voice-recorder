@@ -29,11 +29,27 @@ public class CustomMediaRecorder {
 
         try {
             mediaRecorder = new MediaRecorder();
-            mediaRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+            // UNPROCESSED (API 24+) provides raw mic input without any processing:
+            // no echo cancellation, no noise suppression, no automatic gain control.
+            // This prevents Android from distorting/filtering speaker audio (video playback)
+            // and eliminates metallic artifacts from AGC adjustments.
+            // Falls back to VOICE_RECOGNITION on older devices.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                mediaRecorder.setAudioSource(MediaRecorder.AudioSource.UNPROCESSED);
+            } else {
+                mediaRecorder.setAudioSource(MediaRecorder.AudioSource.VOICE_RECOGNITION);
+            }
             mediaRecorder.setOutputFormat(MediaRecorder.OutputFormat.AAC_ADTS);
             mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
             mediaRecorder.setAudioEncodingBitRate(96000);
             mediaRecorder.setAudioSamplingRate(44100);
+
+            mediaRecorder.setOnErrorListener((mr, what, extra) -> {
+                android.util.Log.e("CustomMediaRecorder", "MediaRecorder error: what=" + what + " extra=" + extra);
+            });
+            mediaRecorder.setOnInfoListener((mr, what, extra) -> {
+                android.util.Log.d("CustomMediaRecorder", "MediaRecorder info: what=" + what + " extra=" + extra);
+            });
 
             android.util.Log.d("CustomMediaRecorder", "MediaRecorder configured, setting output file");
 

@@ -42,12 +42,25 @@ public class RecordData {
         this.mimeType = mimeType;
     }
 
+    private long fileSize;
+
+    public void setFileSize(long fileSize) {
+        this.fileSize = fileSize;
+    }
+
     public JSObject toJSObject() {
         JSObject toReturn = new JSObject();
         toReturn.put("recordDataBase64", recordDataBase64);
         toReturn.put("msDuration", msDuration);
         toReturn.put("mimeType", mimeType);
         toReturn.put("path", path);
+
+        // Add diagnostics matching iOS plugin format
+        JSObject diagnostics = new JSObject();
+        diagnostics.put("recorderType", "MediaRecorder");
+        diagnostics.put("fileSize", fileSize);
+        toReturn.put("diagnostics", diagnostics);
+
         return toReturn;
     }
 }

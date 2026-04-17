@@ -95,8 +95,11 @@ public class VoiceRecorder extends Plugin {
         }
 
         try {
-            // Setup audio focus handling
-            setupAudioFocusHandling();
+            // Skip audio focus handling on Android - microphone works independently of audio focus.
+            // Requesting audio focus causes MediaRecorder to lose mic data when WebView video
+            // plays and triggers AUDIOFOCUS_LOSS. Without focus request, MediaRecorder records
+            // uninterrupted (mic + ambient speaker audio from video).
+            // setupAudioFocusHandling();
 
             String directory = call.getString("directory");
             String subDirectory = call.getString("subDirectory");
@@ -146,6 +149,7 @@ public class VoiceRecorder extends Plugin {
                 "audio/aac",
                 path
             );
+            recordData.setFileSize(recordedFile.length());
             if ((recordDataBase64 == null && path == null) || recordData.getMsDuration() < 0) {
                 call.reject(Messages.EMPTY_RECORDING);
             } else {
