@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import Capacitor
 import CallKit
+import UIKit
 
 @objc(VoiceRecorder)
 public class VoiceRecorder: CAPPlugin {
@@ -217,8 +218,11 @@ public class VoiceRecorder: CAPPlugin {
             if let engineRecorder = recorder as? AudioEngineRecorder {
                 diagnostics["recorderType"] = "engine"
                 diagnostics["conversion"] = engineRecorder.lastConversionResult.toDictionary()
+                diagnostics["engine"] = engineRecorder.getDiagnostics()
             } else {
                 diagnostics["recorderType"] = "legacy"
+                let extra = recorder.getDiagnostics()
+                if !extra.isEmpty { diagnostics["legacy"] = extra }
             }
 
             let sendDataAsBase64 = recorder.options?.directory == nil
@@ -355,6 +359,65 @@ public class VoiceRecorder: CAPPlugin {
         }
     }
 
+    private func gatherInterruptionContext() -> [String: Any] {
+        var ctx: [String: Any] = [:]
+
+        let readMainThreadValues: () -> (String, Double, Bool) = {
+            let stateStr: String
+            switch UIApplication.shared.applicationState {
+            case .active:     stateStr = "active"
+            case .inactive:   stateStr = "inactive"
+            case .background: stateStr = "background"
+            @unknown default: stateStr = "unknown"
+            }
+            return (
+                stateStr,
+                UIApplication.shared.backgroundTimeRemaining,
+                UIApplication.shared.isProtectedDataAvailable
+            )
+        }
+
+        let (appState, bgTime, protectedDataAvailable): (String, Double, Bool)
+        if Thread.isMainThread {
+            (appState, bgTime, protectedDataAvailable) = readMainThreadValues()
+        } else {
+            var tuple: (String, Double, Bool) = ("unknown", -1, false)
+            DispatchQueue.main.sync { tuple = readMainThreadValues() }
+            (appState, bgTime, protectedDataAvailable) = tuple
+        }
+        ctx["app_state"] = appState
+        // backgroundTimeRemaining is .greatestFiniteMagnitude when in foreground — cap for JSON safety.
+        ctx["background_time_remaining_s"] = bgTime.isFinite && bgTime < 1_000_000 ? bgTime : nil
+        ctx["is_protected_data_available"] = protectedDataAvailable
+
+        let processInfo = ProcessInfo.processInfo
+        switch processInfo.thermalState {
+        case .nominal:  ctx["thermal_state"] = "nominal"
+        case .fair:     ctx["thermal_state"] = "fair"
+        case .serious:  ctx["thermal_state"] = "serious"
+        case .critical: ctx["thermal_state"] = "critical"
+        @unknown default: ctx["thermal_state"] = "unknown"
+        }
+        ctx["low_power_mode"] = processInfo.isLowPowerModeEnabled
+
+        let callObserver = CXCallObserver()
+        let activeCalls = callObserver.calls
+        ctx["has_active_call"] = !activeCalls.isEmpty
+        ctx["active_calls_count"] = activeCalls.count
+
+        let session = AVAudioSession.sharedInstance()
+        ctx["other_audio_playing"] = session.isOtherAudioPlaying
+        ctx["audio_session_category"] = session.category.rawValue
+        ctx["audio_session_mode"] = session.mode.rawValue
+        ctx["is_input_available"] = session.isInputAvailable
+        ctx["available_inputs"] = (session.availableInputs ?? []).map { $0.portType.rawValue }
+        ctx["current_route_inputs"] = session.currentRoute.inputs.map { $0.portType.rawValue }
+        ctx["current_route_outputs"] = session.currentRoute.outputs.map { $0.portType.rawValue }
+        ctx["is_microphone_currently_available"] = isMicrophoneCurrentlyAvailable
+
+        return ctx
+    }
+
     private func handleRecordingInterruptionWithReason(_ userInfo: [AnyHashable: Any]) {
         guard customMediaRecorder != nil else {
             return
@@ -431,15 +494,15 @@ public class VoiceRecorder: CAPPlugin {
         if shouldStopRecording {
             isInterrupted = true
 
-            let interruptionData: [String: Any] = [
-                "data": [
-                    "reason": reason,
-                    "timestamp": ISO8601DateFormatter().string(from: Date())
-                ]
+            var payload: [String: Any] = [
+                "reason": reason,
+                "timestamp": ISO8601DateFormatter().string(from: Date()),
+                "source": "audio_session_interruption"
             ]
+            for (k, v) in gatherInterruptionContext() { payload[k] = v }
 
-            NSLog("VoiceRecorder: Sending recordingInterrupted - reason: %@", reason)
-            notifyListeners("recordingInterrupted", data: interruptionData)
+            NSLog("VoiceRecorder: Sending recordingInterrupted - reason: %@, app_state: %@", reason, String(describing: payload["app_state"] ?? "unknown"))
+            notifyListeners("recordingInterrupted", data: ["data": payload])
         } else {
             NSLog("VoiceRecorder: Interruption ignored - recording continues")
         }
@@ -452,16 +515,15 @@ public class VoiceRecorder: CAPPlugin {
         if customMediaRecorder != nil {
             isInterrupted = true
 
-            // Notify JavaScript layer about the recording interruption
-            let interruptionData = [
-                "data": [
-                    "reason": "system_interruption",
-                    "timestamp": ISO8601DateFormatter().string(from: Date())
-                ]
+            var payload: [String: Any] = [
+                "reason": "system_interruption",
+                "timestamp": ISO8601DateFormatter().string(from: Date()),
+                "source": "global_audio_session"
             ]
+            for (k, v) in gatherInterruptionContext() { payload[k] = v }
 
-            NSLog("VoiceRecorder: Sending recordingInterrupted event to JavaScript - reason: system_interruption")
-            notifyListeners("recordingInterrupted", data: interruptionData)
+            NSLog("VoiceRecorder: Sending recordingInterrupted event to JavaScript - reason: system_interruption, app_state: %@", String(describing: payload["app_state"] ?? "unknown"))
+            notifyListeners("recordingInterrupted", data: ["data": payload])
         }
 
         // Handle global microphone availability changes

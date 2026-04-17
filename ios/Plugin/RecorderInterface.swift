@@ -8,4 +8,9 @@ protocol RecorderInterface: AnyObject {
     func resumeRecording() -> Bool
     func getOutputFile() -> URL?
     func getCurrentStatus() -> CurrentRecordingStatus
+    func getDiagnostics() -> [String: Any]
+}
+
+extension RecorderInterface {
+    func getDiagnostics() -> [String: Any] { return [:] }
 }

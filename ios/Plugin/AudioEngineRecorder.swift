@@ -36,6 +36,23 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     private var isPaused = false
     private let writeQueue = DispatchQueue(label: "com.capacitor.voicerecorder.enginewriter")
 
+    // Engine-internal counters updated during recording and consumed by getDiagnostics().
+    // All mutations happen on writeQueue (same queue as pcmFile writes) so reads via
+    // writeQueue.sync are consistent. Reset on each startRecording().
+    private var tapCallbacksCount: UInt64 = 0           // number of tap buffer deliveries from iOS
+    private var framesWrittenCount: UInt64 = 0          // total frames successfully written to PCM file
+    private var writeErrorsCount: UInt64 = 0            // failed pcmFile.write(from:) calls
+    private var lastWriteError: String? = nil           // most recent write error description
+    private var inputSampleRate: Double = 0             // hardware input rate at engine start
+    private var inputChannelCount: UInt32 = 0
+    private var recordingFormatDescription: String? = nil
+    private var engineStartedAt: Date? = nil
+    private var engineStoppedAt: Date? = nil
+    private var pauseStartedAt: Date? = nil
+    private var pausedTotalMs: Double = 0
+    private var pcmFileSizeAtStop: UInt64 = 0
+    private var activationErrorsForDiagnostics: [[String: Any]] = []
+
     private func getDirectoryToSaveAudioFile() throws -> URL {
         if let directory = getDirectory(directory: options.directory),
            var outputDirURL = FileManager.default.urls(for: directory, in: .userDomainMask).first {
@@ -80,6 +97,21 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
     func startRecording(recordOptions: RecordOptions) -> RecordingResult {
         var activationErrors: [[String: Any]] = []
+
+        // Reset per-session diagnostics counters
+        tapCallbacksCount = 0
+        framesWrittenCount = 0
+        writeErrorsCount = 0
+        lastWriteError = nil
+        inputSampleRate = 0
+        inputChannelCount = 0
+        recordingFormatDescription = nil
+        engineStartedAt = nil
+        engineStoppedAt = nil
+        pauseStartedAt = nil
+        pausedTotalMs = 0
+        pcmFileSizeAtStop = 0
+        activationErrorsForDiagnostics = []
 
         do {
             options = recordOptions
@@ -214,11 +246,16 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
             // Install tap on input node to capture audio buffers
             inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
-                guard let self = self, !self.isPaused else { return }
+                guard let self = self else { return }
                 self.writeQueue.async {
+                    self.tapCallbacksCount &+= 1
+                    if self.isPaused { return }
                     do {
                         try self.pcmFile?.write(from: buffer)
+                        self.framesWrittenCount &+= UInt64(buffer.frameLength)
                     } catch {
+                        self.writeErrorsCount &+= 1
+                        self.lastWriteError = error.localizedDescription
                         NSLog("AudioEngineRecorder: Failed to write buffer: %@", error.localizedDescription)
                     }
                 }
@@ -230,6 +267,11 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
             isPaused = false
             status = CurrentRecordingStatus.RECORDING
+            inputSampleRate = inputFormat.sampleRate
+            inputChannelCount = inputFormat.channelCount
+            recordingFormatDescription = inputFormat.description
+            engineStartedAt = Date()
+            activationErrorsForDiagnostics = activationErrors
 
             NSLog("AudioEngineRecorder: Recording started (sampleRate=%.0f, channels=%d, format=%@)",
                   inputFormat.sampleRate, inputFormat.channelCount,
@@ -260,6 +302,13 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     }
 
     func stopRecording() {
+        engineStoppedAt = Date()
+        // Finalize pause accounting if we were paused at stop time.
+        if let pauseStart = pauseStartedAt {
+            pausedTotalMs += Date().timeIntervalSince(pauseStart) * 1000
+            pauseStartedAt = nil
+        }
+
         NSLog("AudioEngineRecorder: stop [A] removing tap")
         // Stop engine and remove tap
         if let engine = audioEngine {
@@ -280,6 +329,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         lastConversionResult = .notAttempted
         if let pcmURL = pcmFileURL, FileManager.default.fileExists(atPath: pcmURL.path) {
             let pcmSize = getFileSize(pcmURL)
+            pcmFileSizeAtStop = pcmSize
             NSLog("AudioEngineRecorder: stop [F] converting PCM→AAC (%llu bytes)", pcmSize)
             lastConversionResult = convertPCMtoAAC(inputURL: pcmURL, outputURL: aacFileURL)
             NSLog("AudioEngineRecorder: stop [G] conversion done: %@",
@@ -351,6 +401,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     func pauseRecording() -> Bool {
         if status == CurrentRecordingStatus.RECORDING {
             isPaused = true
+            pauseStartedAt = Date()
             status = CurrentRecordingStatus.PAUSED
             return true
         }
@@ -360,6 +411,10 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     func resumeRecording() -> Bool {
         if status == CurrentRecordingStatus.PAUSED {
             isPaused = false
+            if let pauseStart = pauseStartedAt {
+                pausedTotalMs += Date().timeIntervalSince(pauseStart) * 1000
+                pauseStartedAt = nil
+            }
             status = CurrentRecordingStatus.RECORDING
             return true
         }
@@ -368,6 +423,56 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
     func getCurrentStatus() -> CurrentRecordingStatus {
         return status
+    }
+
+    func getDiagnostics() -> [String: Any] {
+        // Read counters on the write queue so we see a consistent snapshot
+        // (tap + mutations happen there).
+        var tapCalls: UInt64 = 0
+        var frames: UInt64 = 0
+        var writeErrs: UInt64 = 0
+        var lastErr: String? = nil
+        writeQueue.sync {
+            tapCalls = self.tapCallbacksCount
+            frames = self.framesWrittenCount
+            writeErrs = self.writeErrorsCount
+            lastErr = self.lastWriteError
+        }
+
+        var diag: [String: Any] = [
+            "tap_callbacks": tapCalls,
+            "frames_written": frames,
+            "write_errors": writeErrs,
+            "input_sample_rate": inputSampleRate,
+            "input_channels": inputChannelCount,
+            "paused_total_ms": Int(pausedTotalMs),
+            "pcm_file_size_bytes": pcmFileSizeAtStop,
+            "activation_errors_count": activationErrorsForDiagnostics.count,
+        ]
+        if let lastErr = lastErr { diag["last_write_error"] = lastErr }
+        if let fmt = recordingFormatDescription { diag["input_format"] = fmt }
+        if !activationErrorsForDiagnostics.isEmpty {
+            diag["activation_errors"] = activationErrorsForDiagnostics
+        }
+
+        if let started = engineStartedAt {
+            let ended = engineStoppedAt ?? Date()
+            let runMs = ended.timeIntervalSince(started) * 1000
+            let activeMs = max(0, runMs - pausedTotalMs)
+            diag["engine_run_time_ms"] = Int(runMs)
+            diag["engine_active_time_ms"] = Int(activeMs)
+            if inputSampleRate > 0 && frames > 0 {
+                let audioMs = Double(frames) / inputSampleRate * 1000
+                diag["audio_captured_ms"] = Int(audioMs)
+                if activeMs > 0 {
+                    // Ratio of captured audio vs time engine was running (non-paused).
+                    // <1.0 means mic delivered fewer buffers than expected (silence/dropouts).
+                    diag["audio_capture_ratio"] = audioMs / activeMs
+                }
+            }
+        }
+
+        return diag
     }
 
     // MARK: - Cleanup
