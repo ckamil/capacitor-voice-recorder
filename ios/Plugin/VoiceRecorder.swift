@@ -91,7 +91,11 @@ public class VoiceRecorder: CAPPlugin {
                 NSLog("VoiceRecorder: Recording started with AudioEngineRecorder")
                 self.isInterrupted = false
                 self.wasInterruptedAndStopped = false
-                call.resolve(["value": true, "engine": "audio_engine"])
+                call.resolve([
+                    "value": true,
+                    "engine": "audio_engine",
+                    "engineFallback": NSNull()
+                ])
                 return
             }
 
@@ -129,7 +133,26 @@ public class VoiceRecorder: CAPPlugin {
                 NSLog("VoiceRecorder: Recording started with CustomMediaRecorder (fallback)")
                 self.isInterrupted = false
                 self.wasInterruptedAndStopped = false
-                call.resolve(["value": true, "engine": "legacy"])
+
+                let audioSession = AVAudioSession.sharedInstance()
+                var fallback: [String: Any] = [
+                    "stage": engineResult.error?.stage ?? "unknown",
+                    "error": engineResult.error?.errorDescription ?? "unknown",
+                    "isOtherAudioPlaying": audioSession.isOtherAudioPlaying,
+                    "deviceIdiom": UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
+                ]
+                if let activationErrors = engineResult.error?.details["activationErrors"] as? [[String: Any]] {
+                    fallback["activationErrors"] = activationErrors
+                }
+                if let stageDetails = engineResult.error?.details {
+                    fallback["details"] = stageDetails
+                }
+
+                call.resolve([
+                    "value": true,
+                    "engine": "legacy",
+                    "engineFallback": fallback
+                ])
                 return
             }
 
@@ -177,11 +200,27 @@ public class VoiceRecorder: CAPPlugin {
         // Remove audio session interruption observer
         removeAudioSessionInterruptionHandling()
 
-        NSLog("VoiceRecorder: stopRecording [1] dispatching to background")
+        // Begin background task so iOS gives us up to ~30 s (or more, depending on iOS
+        // policy) to finish PCM→AAC conversion + base64 encoding even when the app has
+        // moved to the background between the user pressing stop and the conversion
+        // finishing. Without this, iOS may suspend the process mid-conversion and the
+        // .aac file is left without a finalized header → app layer sees file_missing.
+        let bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "VoiceRecorderStop") {
+            NSLog("VoiceRecorder: stopRecording background task expired before completion")
+        }
+
+        NSLog("VoiceRecorder: stopRecording [1] dispatching to background (bgTaskId=%lu)",
+              UInt(bgTaskId.rawValue))
 
         // Heavy work (PCM→AAC conversion, base64 encoding) must run off the main thread
         // to avoid freezing the UI.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            defer {
+                if bgTaskId != .invalid {
+                    UIApplication.shared.endBackgroundTask(bgTaskId)
+                }
+            }
+
             guard let self = self else {
                 NSLog("VoiceRecorder: stopRecording [ERR] self is nil")
                 call.reject(Messages.FAILED_TO_FETCH_RECORDING)
@@ -281,6 +320,47 @@ public class VoiceRecorder: CAPPlugin {
             call.resolve(ResponseGenerator.statusResponse(CurrentRecordingStatus.NONE))
         } else {
             call.resolve(ResponseGenerator.statusResponse(customMediaRecorder?.getCurrentStatus() ?? CurrentRecordingStatus.NONE))
+        }
+    }
+
+    /// Returns timestamps recorded by AppDelegate lifecycle hooks plus a derived
+    /// abnormal_restart flag. JS layer polls this once on app start to log the
+    /// previous process's outcome to person_app_logs. After reading, JS calls
+    /// clearAbnormalRestartFlag() so the flag does not re-fire on the next resume.
+    @objc func getLifecycleSnapshot(_ call: CAPPluginCall) {
+        let defaults = UserDefaults.standard
+        // See AppDelegate.applicationDidBecomeActive for why we use `integer(forKey:)`
+        // instead of `object(forKey:) as? Int64` — NSNumber bridging issue.
+        let lastBg = Int64(defaults.integer(forKey: "vr_last_background_at_ms"))
+        let lastClean = Int64(defaults.integer(forKey: "vr_clean_termination_at_ms"))
+        let lastActive = Int64(defaults.integer(forKey: "vr_last_active_at_ms"))
+        let lastResign = Int64(defaults.integer(forKey: "vr_last_resign_active_at_ms"))
+        let abnormal = defaults.bool(forKey: "vr_abnormal_restart_pending")
+
+        call.resolve([
+            "last_background_at_ms": NSNumber(value: lastBg),
+            "last_clean_termination_at_ms": NSNumber(value: lastClean),
+            "last_active_at_ms": NSNumber(value: lastActive),
+            "last_resign_active_at_ms": NSNumber(value: lastResign),
+            "abnormal_restart_pending": abnormal,
+            "thermal_state": self.thermalStateString(),
+            "low_power_mode": ProcessInfo.processInfo.isLowPowerModeEnabled,
+            "is_protected_data_available": UIApplication.shared.isProtectedDataAvailable
+        ])
+    }
+
+    @objc func clearAbnormalRestartFlag(_ call: CAPPluginCall) {
+        UserDefaults.standard.set(false, forKey: "vr_abnormal_restart_pending")
+        call.resolve()
+    }
+
+    private func thermalStateString() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: return "nominal"
+        case .fair: return "fair"
+        case .serious: return "serious"
+        case .critical: return "critical"
+        @unknown default: return "unknown"
         }
     }
 

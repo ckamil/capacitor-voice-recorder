@@ -3,6 +3,21 @@ import type { PluginListenerHandle } from '@capacitor/core';
 
 export type Base64String = string;
 
+export interface EngineFallbackDetails {
+  stage: string;
+  error: string;
+  isOtherAudioPlaying?: boolean;
+  deviceIdiom?: string;
+  activationErrors?: Array<Record<string, any>>;
+  details?: Record<string, any>;
+}
+
+export interface StartRecordingResponse {
+  value: boolean;
+  engine?: 'audio_engine' | 'legacy';
+  engineFallback?: EngineFallbackDetails | null;
+}
+
 export interface RecordingData {
   value: {
     recordDataBase64?: Base64String;
@@ -34,6 +49,17 @@ export interface CurrentRecordingStatus {
   status: (typeof RecordingStatus)[keyof typeof RecordingStatus];
 }
 
+export interface LifecycleSnapshot {
+  last_background_at_ms: number;
+  last_clean_termination_at_ms: number;
+  last_active_at_ms: number;
+  last_resign_active_at_ms: number;
+  abnormal_restart_pending: boolean;
+  thermal_state?: 'nominal' | 'fair' | 'serious' | 'critical' | 'unknown';
+  low_power_mode?: boolean;
+  is_protected_data_available?: boolean;
+}
+
 export interface InterruptionData {
   reason: 'system_interruption' | 'audio_focus_loss' | 'phone_call' | 'other_app';
   timestamp: string;
@@ -59,7 +85,7 @@ export interface VoiceRecorderPlugin {
 
   hasAudioRecordingPermission(): Promise<GenericResponse>;
 
-  startRecording(options?: RecordingOptions): Promise<GenericResponse>;
+  startRecording(options?: RecordingOptions): Promise<StartRecordingResponse>;
 
   stopRecording(): Promise<RecordingData>;
 
@@ -68,6 +94,19 @@ export interface VoiceRecorderPlugin {
   resumeRecording(): Promise<GenericResponse>;
 
   getCurrentStatus(): Promise<CurrentRecordingStatus>;
+
+  /**
+   * Returns timestamps captured by the native AppDelegate lifecycle hooks plus a
+   * derived abnormal_restart_pending flag. Used once on cold start to log the
+   * previous process's outcome to person_app_logs. Web stub returns zeros.
+   */
+  getLifecycleSnapshot(): Promise<LifecycleSnapshot>;
+
+  /**
+   * Clears the abnormal_restart_pending flag after the JS layer has logged it.
+   * Without clearing, the flag would persist and re-fire on the next resume.
+   */
+  clearAbnormalRestartFlag(): Promise<void>;
 
   /**
    * Listen for microphone availability changes (e.g., other apps start/stop using audio)

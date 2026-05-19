@@ -4,8 +4,10 @@ import { VoiceRecorderImpl } from './VoiceRecorderImpl';
 import type {
   CurrentRecordingStatus,
   GenericResponse,
+  LifecycleSnapshot,
   RecordingData,
   RecordingOptions,
+  StartRecordingResponse,
   VoiceRecorderPlugin,
   MicrophoneAvailabilityEvent,
   RecordingInterruptionEvent,
@@ -27,8 +29,9 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
     return VoiceRecorderImpl.requestAudioRecordingPermission();
   }
 
-  public startRecording(options?: RecordingOptions): Promise<GenericResponse> {
-    return this.voiceRecorderInstance.startRecording(options);
+  public async startRecording(options?: RecordingOptions): Promise<StartRecordingResponse> {
+    const result = await this.voiceRecorderInstance.startRecording(options);
+    return { ...result, engineFallback: null };
   }
 
   public stopRecording(): Promise<RecordingData> {
@@ -45,6 +48,20 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
 
   public getCurrentStatus(): Promise<CurrentRecordingStatus> {
     return this.voiceRecorderInstance.getCurrentStatus();
+  }
+
+  public getLifecycleSnapshot(): Promise<LifecycleSnapshot> {
+    return Promise.resolve({
+      last_background_at_ms: 0,
+      last_clean_termination_at_ms: 0,
+      last_active_at_ms: 0,
+      last_resign_active_at_ms: 0,
+      abnormal_restart_pending: false,
+    });
+  }
+
+  public clearAbnormalRestartFlag(): Promise<void> {
+    return Promise.resolve();
   }
 
   /**
@@ -66,8 +83,8 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
   ): Promise<PluginListenerHandle> & PluginListenerHandle;
 
   addListener(
-    eventName: 'microphoneAvailabilityChanged' | 'recordingInterrupted' | 'interruptionEnded',
-    listenerFunc: (event: any) => void,
+    _eventName: 'microphoneAvailabilityChanged' | 'recordingInterrupted' | 'interruptionEnded',
+    _listenerFunc: (event: any) => void,
   ): Promise<PluginListenerHandle> & PluginListenerHandle {
     // Create a dummy listener handle for web
     const handle: PluginListenerHandle = {

@@ -12,4 +12,6 @@ CAP_PLUGIN(VoiceRecorder, "VoiceRecorder",
            CAP_PLUGIN_METHOD(pauseRecording, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(resumeRecording, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(getCurrentStatus, CAPPluginReturnPromise);
+           CAP_PLUGIN_METHOD(getLifecycleSnapshot, CAPPluginReturnPromise);
+           CAP_PLUGIN_METHOD(clearAbnormalRestartFlag, CAPPluginReturnPromise);
 )
