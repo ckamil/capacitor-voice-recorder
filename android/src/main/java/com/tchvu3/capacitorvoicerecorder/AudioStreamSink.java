@@ -60,6 +60,7 @@ public class AudioStreamSink {
     private boolean fatal = false;
     private boolean hasNetwork = true;
     private boolean reportedFinished = false;
+    private boolean startSent = false;
     private int reconnectAttempt = 0;
     private long endMsDuration = 0;
     private long lastDropEventAt = 0;
@@ -118,8 +119,9 @@ public class AudioStreamSink {
             this.formatKnown = true;
             this.maxBufferedFrames = clampFrames((int) Math.round(Math.max(1, config.maxBufferSeconds) * (this.sampleRate / 1024.0)));
             this.maxOutgoingQueueBytes = outgoingQueueBytes(this.maxBufferedFrames);
-            if (connected && webSocket != null) {
+            if (connected && webSocket != null && !startSent) {
                 sendStart();
+                pump();
             }
         });
     }
@@ -200,9 +202,13 @@ public class AudioStreamSink {
         }
         reconnectAttempt = 0;
         finalState = "connected";
-        sendStart();
         emit("connected", null);
-        pump();
+        // Only declare `start` once the real ADTS format is known (parsed from the first frame),
+        // so the server never gets a wrong-then-duplicate format. setFormat() sends it otherwise.
+        if (formatKnown) {
+            sendStart();
+            pump();
+        }
     }
 
     private void sendStart() {
@@ -225,6 +231,7 @@ public class AudioStreamSink {
             start.put("config", config.config);
         }
         webSocket.send(start.toString());
+        startSent = true;
     }
 
     private void handleInbound(String text) {
@@ -239,7 +246,7 @@ public class AudioStreamSink {
     }
 
     private void pump() {
-        if (!connected || finishing || closed || fatal || webSocket == null) return;
+        if (!connected || finishing || closed || fatal || webSocket == null || !startSent) return;
         while (!pending.isEmpty()) {
             // OkHttp.send() returns true once a message is queued in its OWN (large) outgoing
             // buffer, not when it hits the wire. On a slow-but-alive link that buffer could grow
@@ -265,6 +272,7 @@ public class AudioStreamSink {
 
         boolean wasConnected = connected;
         connected = false;
+        startSent = false; // a fresh connection must re-send `start`
         if (webSocket != null) {
             webSocket.cancel();
             webSocket = null;
@@ -356,7 +364,7 @@ public class AudioStreamSink {
     // ----- Finish / teardown (on exec) -----
 
     private void drainThenEnd(long deadlineMs) {
-        while (connected && webSocket != null && !pending.isEmpty() && System.currentTimeMillis() <= deadlineMs) {
+        while (connected && webSocket != null && startSent && !pending.isEmpty() && System.currentTimeMillis() <= deadlineMs) {
             byte[] payload = pending.peekFirst();
             if (!webSocket.send(ByteString.of(payload))) {
                 break;

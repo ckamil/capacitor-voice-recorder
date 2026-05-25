@@ -74,8 +74,11 @@ public class StreamingConfig {
         JSObject config = obj.getJSObject("config");
 
         JSObject reconnect = obj.getJSObject("reconnect");
-        int initialDelayMs = reconnect != null ? reconnect.optInt("initialDelayMs", 1000) : 1000;
+        // Floor the initial delay at 50ms and keep maxDelay >= initial (parity with iOS), so a tiny
+        // misconfigured value cannot turn reconnect into a busy-retry storm.
+        int initialDelayMs = Math.max(50, reconnect != null ? reconnect.optInt("initialDelayMs", 1000) : 1000);
         int maxDelayMs = reconnect != null ? reconnect.optInt("maxDelayMs", 8000) : 8000;
+        maxDelayMs = Math.max(initialDelayMs, maxDelayMs);
         int maxAttempts = reconnect != null ? reconnect.optInt("maxAttempts", 0) : 0;
 
         double maxBufferSeconds = obj.optDouble("maxBufferSeconds", 10);

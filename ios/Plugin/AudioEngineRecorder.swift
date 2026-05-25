@@ -385,6 +385,9 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         guard let engine = audioEngine, let fmt = recordingFormat else { return }
         let inputNode = engine.inputNode
         inputNode.removeTap(onBus: 0)
+        // Captured by value (immutable) so the real-time render thread never reads the mutable
+        // streamSink/streamEncoder references; those are confined to streamQueue.
+        let streamingEnabled = (options?.streaming != nil)
         inputNode.installTap(onBus: 0, bufferSize: 4096, format: fmt) { [weak self] buffer, _ in
             guard let self = self else { return }
             self.writeQueue.async {
@@ -403,16 +406,19 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
             // Additive live stream: encode + enqueue on a SEPARATE queue so a slow/failing
             // network never delays the file writes above. Skipped while paused (like the file).
-            if self.streamSink != nil {
+            if streamingEnabled {
                 self.streamQueue.async {
                     guard !self.isPaused,
                           let encoder = self.streamEncoder,
                           let sink = self.streamSink else { return }
                     let frames = encoder.encode(buffer)
                     guard !frames.isEmpty else { return }
-                    let rate = fmt.sampleRate > 0 ? fmt.sampleRate : 48000
+                    let rate = UInt64(fmt.sampleRate > 0 ? fmt.sampleRate : 48000)
                     for frame in frames {
-                        let tsMs = UInt32((Double(self.streamFramesEnqueued) * 1024.0 / rate * 1000.0).rounded())
+                        // Integer math + truncating cast: avoids a UInt32(Double) overflow trap on
+                        // extremely long recordings and matches Android's 32-bit wrap behaviour.
+                        let ms = self.streamFramesEnqueued &* 1024 &* 1000 / max(1, rate)
+                        let tsMs = UInt32(truncatingIfNeeded: ms)
                         sink.enqueue(seq: self.streamSeq, timestampMs: tsMs, adts: frame)
                         self.streamSeq = self.streamSeq &+ 1
                         self.streamFramesEnqueued &+= 1
@@ -486,15 +492,21 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
         // Finish the live stream (if any). The tap is already removed, so streamQueue.sync acts as
         // a barrier draining the last encodes before we read the final frame count and close.
-        if let sink = streamSink {
-            var totalFrames: UInt64 = 0
-            streamQueue.sync { totalFrames = self.streamFramesEnqueued }
+        // Read the counters and clear the references on streamQueue (their only owner), then
+        // finalize the sink off-queue. Tap is already removed, so this also drains any last encode.
+        var totalStreamFrames: UInt64 = 0
+        var sinkToFinish: AudioStreamSink?
+        streamQueue.sync {
+            totalStreamFrames = self.streamFramesEnqueued
+            sinkToFinish = self.streamSink
+            self.streamSink = nil
+            self.streamEncoder = nil
+        }
+        if let sink = sinkToFinish {
             let rate = inputSampleRate > 0 ? inputSampleRate : 48000
-            let msDuration = Int((Double(totalFrames) * 1024.0 / rate * 1000.0).rounded())
-            sink.finish(framesEnqueued: totalFrames, msDuration: msDuration)
+            let msDuration = Int((Double(totalStreamFrames) * 1024.0 / rate * 1000.0).rounded())
+            sink.finish(framesEnqueued: totalStreamFrames, msDuration: msDuration)
             lastStreamingDiagnostics = sink.diagnosticsSnapshot()
-            streamSink = nil
-            streamEncoder = nil
         }
 
         // Restore audio session — retry deactivation to prevent orphaned .playAndRecord
@@ -650,8 +662,12 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         ) { [weak self] event in
             self?.onStreamEvent?(event)
         }
-        streamEncoder = encoder
-        streamSink = sink
+        // Assign on streamQueue so these references are only ever touched there (the tap reads
+        // them on streamQueue, stop nils them there) — no cross-thread access to the references.
+        streamQueue.async {
+            self.streamEncoder = encoder
+            self.streamSink = sink
+        }
         sink.start()
     }
 

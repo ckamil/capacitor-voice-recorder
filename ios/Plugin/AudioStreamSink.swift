@@ -93,11 +93,15 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
     // MARK: - Public API (called from the recorder)
 
     func start() {
-        pathMonitor.pathUpdateHandler = { [weak self] path in
-            // Delivered on `queue` (we start the monitor on it).
-            self?.handlePathUpdate(path)
+        // Only observe reachability when asked to (parity with Android, which skips the network
+        // callback entirely when requireReachability is false).
+        if requireReachability {
+            pathMonitor.pathUpdateHandler = { [weak self] path in
+                // Delivered on `queue` (we start the monitor on it).
+                self?.handlePathUpdate(path)
+            }
+            pathMonitor.start(queue: queue)
         }
-        pathMonitor.start(queue: queue)
         queue.async { [weak self] in
             guard let self = self, !self.isClosed else { return }
             self.emit(["type": "connecting"])

@@ -447,12 +447,14 @@ public class VoiceRecorder: CAPPlugin {
             for (key, value) in rawConfig { configPayload[key] = value }
         }
 
+        // Coerce via NSNumber so a JS number bridged as the "other" numeric type is still honoured
+        // (matches Android's optInt/optDouble); `as? Int` alone would silently fall back to default.
         let reconnect = obj["reconnect"] as? JSObject
-        let initialDelayMs = (reconnect?["initialDelayMs"] as? Int) ?? 1000
-        let maxDelayMs = (reconnect?["maxDelayMs"] as? Int) ?? 8000
-        let maxAttempts = (reconnect?["maxAttempts"] as? Int) ?? 0
-        let maxBufferSeconds = (obj["maxBufferSeconds"] as? Double) ?? 10
-        let pingIntervalMs = (obj["pingIntervalMs"] as? Int) ?? 20000
+        let initialDelayMs = (reconnect?["initialDelayMs"] as? NSNumber)?.intValue ?? 1000
+        let maxDelayMs = (reconnect?["maxDelayMs"] as? NSNumber)?.intValue ?? 8000
+        let maxAttempts = (reconnect?["maxAttempts"] as? NSNumber)?.intValue ?? 0
+        let maxBufferSeconds = (obj["maxBufferSeconds"] as? NSNumber)?.doubleValue ?? 10
+        let pingIntervalMs = (obj["pingIntervalMs"] as? NSNumber)?.intValue ?? 20000
         let requireReachability = (obj["requireReachability"] as? Bool) ?? true
 
         return StreamingConfig(
