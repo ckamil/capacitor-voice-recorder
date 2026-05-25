@@ -49,6 +49,7 @@ public class AudioStreamSink {
     private WebSocket webSocket;
     private final ArrayDeque<byte[]> pending = new ArrayDeque<>();
     private int maxBufferedFrames;
+    private long maxOutgoingQueueBytes;
     private int sampleRate = 44100;
     private int channels = 1;
     private boolean formatKnown = false;
@@ -81,6 +82,7 @@ public class AudioStreamSink {
         this.recordingId = recordingId;
         this.events = events;
         this.maxBufferedFrames = clampFrames((int) Math.round(Math.max(1, config.maxBufferSeconds) * 47));
+        this.maxOutgoingQueueBytes = outgoingQueueBytes(this.maxBufferedFrames);
 
         ThreadFactory factory = r -> {
             Thread t = new Thread(r, "vr-stream-sink");
@@ -115,6 +117,7 @@ public class AudioStreamSink {
             this.channels = channels > 0 ? channels : 1;
             this.formatKnown = true;
             this.maxBufferedFrames = clampFrames((int) Math.round(Math.max(1, config.maxBufferSeconds) * (this.sampleRate / 1024.0)));
+            this.maxOutgoingQueueBytes = outgoingQueueBytes(this.maxBufferedFrames);
             if (connected && webSocket != null) {
                 sendStart();
             }
@@ -238,9 +241,16 @@ public class AudioStreamSink {
     private void pump() {
         if (!connected || finishing || closed || fatal || webSocket == null) return;
         while (!pending.isEmpty()) {
+            // OkHttp.send() returns true once a message is queued in its OWN (large) outgoing
+            // buffer, not when it hits the wire. On a slow-but-alive link that buffer could grow
+            // past our maxBufferSeconds bound, so stop handing it frames once its queue is full —
+            // frames then stay in our bounded deque (drop-oldest), preserving the memory bound.
+            if (webSocket.queueSize() > maxOutgoingQueueBytes) {
+                break;
+            }
             byte[] payload = pending.peekFirst();
             if (!webSocket.send(ByteString.of(payload))) {
-                break; // OkHttp queue full or socket closing — retry later / reconnect
+                break; // socket closing — will reconnect
             }
             pending.pollFirst();
             framesSent++;
@@ -510,6 +520,11 @@ public class AudioStreamSink {
 
     private static int clampFrames(int n) {
         return Math.min(Math.max(n, 8), 200000);
+    }
+
+    /** Cap for OkHttp's own outgoing queue, so a slow link cannot balloon memory past our bound. */
+    private static long outgoingQueueBytes(int frames) {
+        return Math.max(64L * 1024, (long) frames * 512);
     }
 
     private static boolean isFatalHttp(int status) {

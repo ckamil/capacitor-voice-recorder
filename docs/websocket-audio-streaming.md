@@ -424,6 +424,11 @@ diagnostics:
 }
 ```
 
+> `diagnostics.streaming` is a **best-effort snapshot** taken as the recording
+> stops (the final `end`/flush is asynchronous), so `framesSent`/`bytesSent` may
+> omit the last few drained frames. The **authoritative final totals are in the
+> `finished` event** — prefer it when exact counts matter.
+
 ---
 
 ## 8. Minimal backend reference (Node, `ws`)
