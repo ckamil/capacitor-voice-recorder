@@ -2,33 +2,12 @@ import Foundation
 import AVFoundation
 import UIKit
 
-enum ConversionResult {
-    case success(fileSize: UInt64)
-    case fallbackToPCMCopy(reason: String, fileSize: UInt64)
-    case failed(reason: String)
-    case notAttempted
-
-    func toDictionary() -> [String: Any] {
-        switch self {
-        case .success(let fileSize):
-            return ["status": "success", "fileSize": fileSize]
-        case .fallbackToPCMCopy(let reason, let fileSize):
-            return ["status": "fallback_pcm_copy", "reason": reason, "fileSize": fileSize]
-        case .failed(let reason):
-            return ["status": "failed", "reason": reason]
-        case .notAttempted:
-            return ["status": "not_attempted"]
-        }
-    }
-}
-
 class AudioEngineRecorder: NSObject, RecorderInterface {
 
     var options: RecordOptions!
-    var lastConversionResult: ConversionResult = .notAttempted
     private var audioEngine: AVAudioEngine!
-    private var pcmFile: AVAudioFile!
-    private var pcmFileURL: URL!
+    // AAC (ADTS) output written live from the tap — no intermediate PCM file.
+    private var aacExtFile: ExtAudioFileRef?
     private var aacFileURL: URL!
     private var recordingSession: AVAudioSession!
     private var originalRecordingSessionCategory: AVAudioSession.Category!
@@ -36,12 +15,17 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     private var isPaused = false
     private let writeQueue = DispatchQueue(label: "com.capacitor.voicerecorder.enginewriter")
 
+    // Fixed tap/encoder PCM format, kept so the tap can be re-installed after an engine
+    // configuration change (route/sample-rate change) without breaking the AAC client format.
+    private var recordingFormat: AVAudioFormat?
+    private var engineConfigObserver: NSObjectProtocol?
+
     // Engine-internal counters updated during recording and consumed by getDiagnostics().
-    // All mutations happen on writeQueue (same queue as pcmFile writes) so reads via
+    // All mutations happen on writeQueue (same queue as the AAC writes) so reads via
     // writeQueue.sync are consistent. Reset on each startRecording().
     private var tapCallbacksCount: UInt64 = 0           // number of tap buffer deliveries from iOS
-    private var framesWrittenCount: UInt64 = 0          // total frames successfully written to PCM file
-    private var writeErrorsCount: UInt64 = 0            // failed pcmFile.write(from:) calls
+    private var framesWrittenCount: UInt64 = 0          // total frames successfully encoded to AAC
+    private var writeErrorsCount: UInt64 = 0            // failed ExtAudioFileWrite calls
     private var lastWriteError: String? = nil           // most recent write error description
     private var inputSampleRate: Double = 0             // hardware input rate at engine start
     private var inputChannelCount: UInt32 = 0
@@ -50,7 +34,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     private var engineStoppedAt: Date? = nil
     private var pauseStartedAt: Date? = nil
     private var pausedTotalMs: Double = 0
-    private var pcmFileSizeAtStop: UInt64 = 0
+    private var engineRestartCount: Int = 0     // times the engine was auto-restarted after a config change
     private var activationErrorsForDiagnostics: [[String: Any]] = []
 
     private func getDirectoryToSaveAudioFile() throws -> URL {
@@ -110,7 +94,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         engineStoppedAt = nil
         pauseStartedAt = nil
         pausedTotalMs = 0
-        pcmFileSizeAtStop = 0
+        engineRestartCount = 0
         activationErrorsForDiagnostics = []
 
         do {
@@ -206,10 +190,9 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             let stabilisationDelay: TimeInterval = isIPad ? 0.5 : 0.1
             Thread.sleep(forTimeInterval: stabilisationDelay)
 
-            // Prepare output directory and file paths
+            // Prepare output directory and file path
             let outputDir = try getDirectoryToSaveAudioFile()
             let timestamp = Int(Date().timeIntervalSince1970 * 1000)
-            pcmFileURL = outputDir.appendingPathComponent("recording-\(timestamp)-pcm.wav")
             aacFileURL = outputDir.appendingPathComponent("recording-\(timestamp).aac")
 
             // Set up AVAudioEngine
@@ -232,38 +215,43 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
                 )
             }
 
-            // Create mono format for recording (match input sample rate)
+            // Create mono format for the tap (match input sample rate). This is also the
+            // client (PCM) data format we feed into the AAC encoder below. Kept fixed for the
+            // whole recording so it survives a route/sample-rate change (the engine resamples
+            // into this format when the tap is re-installed after a configuration change).
             let recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
                                                 sampleRate: inputFormat.sampleRate,
                                                 channels: 1,
                                                 interleaved: false)!
+            self.recordingFormat = recordingFormat
 
-            // Create PCM file for writing
-            pcmFile = try AVAudioFile(forWriting: pcmFileURL,
-                                      settings: recordingFormat.settings,
-                                      commonFormat: .pcmFormatFloat32,
-                                      interleaved: false)
-
-            // Install tap on input node to capture audio buffers
-            inputNode.installTap(onBus: 0, bufferSize: 4096, format: recordingFormat) { [weak self] buffer, _ in
-                guard let self = self else { return }
-                self.writeQueue.async {
-                    self.tapCallbacksCount &+= 1
-                    if self.isPaused { return }
-                    do {
-                        try self.pcmFile?.write(from: buffer)
-                        self.framesWrittenCount &+= UInt64(buffer.frameLength)
-                    } catch {
-                        self.writeErrorsCount &+= 1
-                        self.lastWriteError = error.localizedDescription
-                        NSLog("AudioEngineRecorder: Failed to write buffer: %@", error.localizedDescription)
-                    }
-                }
+            // Open the AAC (ADTS) output file and encode the tap's PCM directly to AAC,
+            // streamed (no intermediate WAV, no conversion step at stop). Any failure here
+            // is treated as an engine-start failure so VoiceRecorder falls back to legacy.
+            if let openFailure = openAacFile(clientFormat: recordingFormat, sampleRate: inputFormat.sampleRate) {
+                cleanupAfterFailedStart()
+                return openFailure
             }
+
+            // Install tap to capture audio buffers and encode them to AAC.
+            installInputTap()
 
             // Start the engine
             audioEngine.prepare()
             try audioEngine.start()
+
+            // Recover from route/sample-rate changes (Bluetooth/headphones connect, WebView
+            // reconfiguring the shared session, etc.) which make iOS STOP the engine. Without
+            // this the tap goes silent and capture is lost mid-recording (a classic cause of
+            // "only ~1s recorded"). On the notification we re-install the tap and restart the
+            // engine into the SAME open AAC file, so recording continues seamlessly.
+            engineConfigObserver = NotificationCenter.default.addObserver(
+                forName: .AVAudioEngineConfigurationChange,
+                object: audioEngine,
+                queue: nil
+            ) { [weak self] _ in
+                self?.handleEngineConfigurationChange()
+            }
 
             isPaused = false
             status = CurrentRecordingStatus.RECORDING
@@ -301,7 +289,134 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         }
     }
 
+    /// Open the ADTS AAC output file and set its client (input) data format to the tap's PCM
+    /// format. Returns a RecordingResult.failure on any error (so the caller falls back to
+    /// legacy), or nil on success (`aacExtFile` is then ready for writes).
+    private func openAacFile(clientFormat: AVAudioFormat, sampleRate: Double) -> RecordingResult? {
+        var outputDescription = AudioStreamBasicDescription(
+            mSampleRate: sampleRate,
+            mFormatID: kAudioFormatMPEG4AAC,
+            mFormatFlags: 0,
+            mBytesPerPacket: 0,
+            mFramesPerPacket: 1024,
+            mBytesPerFrame: 0,
+            mChannelsPerFrame: 1,
+            mBitsPerChannel: 0,
+            mReserved: 0
+        )
+
+        var extFileRef: ExtAudioFileRef?
+        var st = ExtAudioFileCreateWithURL(
+            aacFileURL as CFURL,
+            kAudioFileAAC_ADTSType,
+            &outputDescription,
+            nil,
+            AudioFileFlags.eraseFile.rawValue,
+            &extFileRef
+        )
+
+        guard st == noErr, let extFile = extFileRef else {
+            NSLog("AudioEngineRecorder: ExtAudioFileCreateWithURL failed: %d", st)
+            return RecordingResult.failure(
+                stage: "engine_aac_open",
+                details: ["recorderType": "engine", "step": "create", "status": Int(st), "sampleRate": sampleRate],
+                errorDescription: "ExtAudioFileCreateWithURL failed: \(st)"
+            )
+        }
+
+        // C1: client format MUST come from the same AVAudioFormat used to install the tap,
+        // so non-interleaved/float32/packed flags and byte counts are correct.
+        var clientASBD = clientFormat.streamDescription.pointee
+        st = ExtAudioFileSetProperty(
+            extFile,
+            kExtAudioFileProperty_ClientDataFormat,
+            UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
+            &clientASBD
+        )
+
+        if st != noErr {
+            NSLog("AudioEngineRecorder: set ClientDataFormat failed: %d", st)
+            ExtAudioFileDispose(extFile)
+            return RecordingResult.failure(
+                stage: "engine_aac_open",
+                details: ["recorderType": "engine", "step": "client_format", "status": Int(st)],
+                errorDescription: "ExtAudioFileSetProperty(ClientDataFormat) failed: \(st)"
+            )
+        }
+
+        aacExtFile = extFile
+
+        // Allow writes while the device is locked in the background — proximity-triggered
+        // recordings can start with the screen locked, and the default data-protection class
+        // would otherwise block disk writes until the next unlock.
+        try? FileManager.default.setAttributes(
+            [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+            ofItemAtPath: aacFileURL.path
+        )
+
+        return nil
+    }
+
+    /// (Re)install the input tap that encodes PCM buffers to AAC. Uses the fixed
+    /// `recordingFormat`, so the engine resamples for us if the hardware route changed its
+    /// rate. The AVAudioPCMBuffer is captured (retained) into the async block, keeping its
+    /// backing store valid for ExtAudioFileWrite.
+    private func installInputTap() {
+        guard let engine = audioEngine, let fmt = recordingFormat else { return }
+        let inputNode = engine.inputNode
+        inputNode.removeTap(onBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: fmt) { [weak self] buffer, _ in
+            guard let self = self else { return }
+            self.writeQueue.async {
+                self.tapCallbacksCount &+= 1
+                if self.isPaused { return }
+                guard let ext = self.aacExtFile else { return }
+                let st = ExtAudioFileWrite(ext, buffer.frameLength, buffer.audioBufferList)
+                if st == noErr {
+                    self.framesWrittenCount &+= UInt64(buffer.frameLength)
+                } else {
+                    self.writeErrorsCount &+= 1
+                    self.lastWriteError = "ExtAudioFileWrite \(st)"
+                    NSLog("AudioEngineRecorder: Failed to encode AAC buffer: %d", st)
+                }
+            }
+        }
+    }
+
+    /// Engine stopped because the audio route/format changed (Bluetooth/headset connect or
+    /// disconnect, WebView reconfiguring the shared session for presentation audio, sample
+    /// rate change, etc.). Re-establish the tap and restart the engine so capture continues
+    /// into the SAME open AAC file. Best-effort: if restart fails the recording ends at the
+    /// change point (no worse than before this handler existed).
+    private func handleEngineConfigurationChange() {
+        guard status == CurrentRecordingStatus.RECORDING, let engine = audioEngine else { return }
+        if engine.isRunning { return } // engine survived the change — nothing to do
+        NSLog("AudioEngineRecorder: configuration change — engine stopped, attempting restart")
+        try? recordingSession?.setActive(true)
+        installInputTap()
+        engine.prepare()
+        do {
+            try engine.start()
+            engineRestartCount += 1
+            NSLog("AudioEngineRecorder: engine restarted after configuration change (#%d)", engineRestartCount)
+        } catch {
+            NSLog("AudioEngineRecorder: engine restart FAILED after configuration change: %@", error.localizedDescription)
+            lastWriteError = "engine_restart_failed: \(error.localizedDescription)"
+        }
+    }
+
+    private func removeEngineConfigObserver() {
+        if let obs = engineConfigObserver {
+            NotificationCenter.default.removeObserver(obs)
+            engineConfigObserver = nil
+        }
+    }
+
     func stopRecording() {
+        // Stop reacting to configuration changes before we tear the engine down, so a late
+        // notification cannot restart an engine we are finalizing.
+        removeEngineConfigObserver()
+
         engineStoppedAt = Date()
         // Finalize pause accounting if we were paused at stop time.
         if let pauseStart = pauseStartedAt {
@@ -318,42 +433,17 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             NSLog("AudioEngineRecorder: stop [C] engine stopped")
         }
 
-        // Wait for all pending writes to complete, then finalize PCM file.
-        NSLog("AudioEngineRecorder: stop [D] writeQueue.sync")
+        // C2: drain any queued writes and finalize the AAC file on the SAME queue the tap
+        // writes on, so the file is never disposed while a queued ExtAudioFileWrite is still
+        // in flight (would write to a freed ref). Dispose flushes the trailing AAC packet.
+        NSLog("AudioEngineRecorder: stop [D] writeQueue.sync (finalize AAC)")
         writeQueue.sync {
-            self.pcmFile = nil
-        }
-        NSLog("AudioEngineRecorder: stop [E] writeQueue done")
-
-        // Convert PCM to AAC
-        lastConversionResult = .notAttempted
-        if let pcmURL = pcmFileURL, FileManager.default.fileExists(atPath: pcmURL.path) {
-            let pcmSize = getFileSize(pcmURL)
-            pcmFileSizeAtStop = pcmSize
-            NSLog("AudioEngineRecorder: stop [F] converting PCM→AAC (%llu bytes)", pcmSize)
-            lastConversionResult = convertPCMtoAAC(inputURL: pcmURL, outputURL: aacFileURL)
-            NSLog("AudioEngineRecorder: stop [G] conversion done: %@",
-                  String(describing: lastConversionResult.toDictionary()))
-
-            // If conversion failed entirely, attempt last-resort PCM copy
-            if case .failed = lastConversionResult {
-                if !FileManager.default.fileExists(atPath: aacFileURL.path) {
-                    if let _ = try? FileManager.default.copyItem(at: pcmURL, to: aacFileURL),
-                       let attrs = try? FileManager.default.attributesOfItem(atPath: aacFileURL.path),
-                       let size = attrs[.size] as? UInt64 {
-                        lastConversionResult = .fallbackToPCMCopy(reason: "last_resort_copy", fileSize: size)
-                        NSLog("AudioEngineRecorder: Last resort PCM copy succeeded (%llu bytes)", size)
-                    } else {
-                        NSLog("AudioEngineRecorder: Last resort PCM copy also failed")
-                    }
-                }
+            if let ext = self.aacExtFile {
+                ExtAudioFileDispose(ext)
+                self.aacExtFile = nil
             }
-
-            // Clean up temp PCM file
-            try? FileManager.default.removeItem(at: pcmURL)
-        } else {
-            NSLog("AudioEngineRecorder: stop [F] no PCM file to convert")
         }
+        NSLog("AudioEngineRecorder: stop [E] AAC finalized")
 
         // Restore audio session — retry deactivation to prevent orphaned .playAndRecord
         NSLog("AudioEngineRecorder: stop [H] restoring audio session")
@@ -388,6 +478,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
         originalRecordingSessionCategory = nil
         audioEngine = nil
+        recordingFormat = nil
         recordingSession = nil
         isPaused = false
         status = CurrentRecordingStatus.NONE
@@ -446,7 +537,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             "input_sample_rate": inputSampleRate,
             "input_channels": inputChannelCount,
             "paused_total_ms": Int(pausedTotalMs),
-            "pcm_file_size_bytes": pcmFileSizeAtStop,
+            "engine_restarts": engineRestartCount,
             "activation_errors_count": activationErrorsForDiagnostics.count,
         ]
         if let lastErr = lastErr { diag["last_write_error"] = lastErr }
@@ -479,12 +570,17 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
 
     private func cleanupAfterFailedStart() {
         NSLog("AudioEngineRecorder: cleanupAfterFailedStart")
+        removeEngineConfigObserver()
         if let engine = audioEngine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()
         }
         audioEngine = nil
-        pcmFile = nil
+        recordingFormat = nil
+        if let ext = aacExtFile {
+            ExtAudioFileDispose(ext)
+            aacExtFile = nil
+        }
 
         // Restore audio session to original state so legacy recorder can use it cleanly
         do {
@@ -498,135 +594,5 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         originalRecordingSessionCategory = nil
         recordingSession = nil
         status = CurrentRecordingStatus.NONE
-    }
-
-    // MARK: - PCM to AAC Conversion
-
-    private func getFileSize(_ url: URL) -> UInt64 {
-        return (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? UInt64) ?? 0
-    }
-
-    private func fallbackCopyPCM(from inputURL: URL, to outputURL: URL, reason: String) -> ConversionResult {
-        NSLog("AudioEngineRecorder: Falling back to PCM copy (%@)", reason)
-        if let _ = try? FileManager.default.copyItem(at: inputURL, to: outputURL) {
-            let size = getFileSize(outputURL)
-            return .fallbackToPCMCopy(reason: reason, fileSize: size)
-        }
-        return .failed(reason: reason)
-    }
-
-    private func convertPCMtoAAC(inputURL: URL, outputURL: URL) -> ConversionResult {
-        do {
-            let inputFile = try AVAudioFile(forReading: inputURL)
-            let inputFormat = inputFile.processingFormat
-            let totalFrames = AVAudioFrameCount(inputFile.length)
-
-            guard totalFrames > 0 else {
-                NSLog("AudioEngineRecorder: No audio frames to convert")
-                return .failed(reason: "no_audio_frames")
-            }
-
-            NSLog("AudioEngineRecorder: Converting %d frames (%.1fs) PCM→AAC",
-                  totalFrames, Double(totalFrames) / inputFormat.sampleRate)
-
-            // Set up AAC output format
-            var outputDescription = AudioStreamBasicDescription(
-                mSampleRate: inputFormat.sampleRate,
-                mFormatID: kAudioFormatMPEG4AAC,
-                mFormatFlags: 0,
-                mBytesPerPacket: 0,
-                mFramesPerPacket: 1024,
-                mBytesPerFrame: 0,
-                mChannelsPerFrame: 1,
-                mBitsPerChannel: 0,
-                mReserved: 0
-            )
-
-            guard let outputFormat = AVAudioFormat(streamDescription: &outputDescription) else {
-                NSLog("AudioEngineRecorder: Failed to create AAC output format")
-                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "aac_format_creation_failed")
-            }
-
-            // Create output file (ExtAudioFile handles PCM→AAC encoding internally)
-            var outputFileRef: ExtAudioFileRef?
-            var status = ExtAudioFileCreateWithURL(
-                outputURL as CFURL,
-                kAudioFileAAC_ADTSType,
-                &outputDescription,
-                nil,
-                AudioFileFlags.eraseFile.rawValue,
-                &outputFileRef
-            )
-
-            guard status == noErr, let outputFile = outputFileRef else {
-                NSLog("AudioEngineRecorder: Failed to create output AAC file: %d", status)
-                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "output_file_creation_failed_\(status)")
-            }
-
-            // Set client format to match input PCM format
-            var clientFormat = inputFormat.streamDescription.pointee
-            status = ExtAudioFileSetProperty(
-                outputFile,
-                kExtAudioFileProperty_ClientDataFormat,
-                UInt32(MemoryLayout<AudioStreamBasicDescription>.size),
-                &clientFormat
-            )
-
-            if status != noErr {
-                NSLog("AudioEngineRecorder: Failed to set client format: %d", status)
-                ExtAudioFileDispose(outputFile)
-                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "client_format_failed_\(status)")
-            }
-
-            // Process in chunks to avoid OOM — ~1 second of audio per chunk
-            let chunkSize = AVAudioFrameCount(inputFormat.sampleRate)
-            guard let chunkBuffer = AVAudioPCMBuffer(pcmFormat: inputFormat, frameCapacity: chunkSize) else {
-                NSLog("AudioEngineRecorder: Failed to create chunk buffer")
-                ExtAudioFileDispose(outputFile)
-                return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "chunk_buffer_failed")
-            }
-
-            var framesWritten: AVAudioFrameCount = 0
-            var chunkIndex = 0
-            while framesWritten < totalFrames {
-                let framesToRead = min(chunkSize, totalFrames - framesWritten)
-
-                try inputFile.read(into: chunkBuffer, frameCount: framesToRead)
-                let actualFrames = chunkBuffer.frameLength
-
-                NSLog("AudioEngineRecorder: chunk %d: requested=%d, read=%d, position=%lld/%d",
-                      chunkIndex, framesToRead, actualFrames, inputFile.framePosition, totalFrames)
-
-                let bufferList = chunkBuffer.audioBufferList
-                status = ExtAudioFileWrite(outputFile, actualFrames, bufferList)
-
-                if status != noErr {
-                    NSLog("AudioEngineRecorder: Failed to write AAC chunk %d at frame %d: %d",
-                          chunkIndex, framesWritten, status)
-                    ExtAudioFileDispose(outputFile)
-                    return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "write_failed_\(status)")
-                }
-
-                framesWritten += actualFrames
-                chunkIndex += 1
-
-                if actualFrames == 0 {
-                    NSLog("AudioEngineRecorder: read returned 0 frames, breaking")
-                    break
-                }
-            }
-
-            ExtAudioFileDispose(outputFile)
-
-            let outputSize = getFileSize(outputURL)
-            NSLog("AudioEngineRecorder: PCM→AAC conversion complete (%d frames, %.1fs, %llu bytes)",
-                  totalFrames, Double(totalFrames) / inputFormat.sampleRate, outputSize)
-
-            return .success(fileSize: outputSize)
-
-        } catch {
-            NSLog("AudioEngineRecorder: Conversion failed: %@", error.localizedDescription)
-            return fallbackCopyPCM(from: inputURL, to: outputURL, reason: "exception_\(error.localizedDescription)")
-        }
     }
 }

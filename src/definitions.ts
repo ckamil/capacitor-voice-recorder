@@ -33,6 +33,10 @@ export type RecordingOptions =
   | {
       directory: Directory;
       subDirectory?: string;
+      // When true, ambiguous audio-session interruptions (no reason / unknown reason /
+      // iOS < 14.5) let the recording CONTINUE (relying on the native engine auto-restart)
+      // instead of stopping. Default false. Drive from SettingsService for remote control.
+      continueOnAmbiguousInterruption?: boolean;
     };
 
 export interface GenericResponse {
@@ -61,7 +65,7 @@ export interface LifecycleSnapshot {
 }
 
 export interface InterruptionData {
-  reason: 'system_interruption' | 'audio_focus_loss' | 'phone_call' | 'other_app';
+  reason: 'system_interruption' | 'audio_focus_loss' | 'phone_call' | 'other_app' | 'media_services_reset';
   timestamp: string;
 }
 

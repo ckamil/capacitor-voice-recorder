@@ -8,6 +8,17 @@ import UIKit
 public class VoiceRecorder: CAPPlugin {
 
     private var customMediaRecorder: RecorderInterface?
+    // Held for the whole duration of an active recording so iOS treats the app as doing
+    // important work and is less likely to suspend it in the background. The `audio`
+    // background mode is the primary keep-alive; this is a belt-and-suspenders that also
+    // protects the start handshake when a recording is launched into the background by a
+    // location event.
+    private var recordingBgTaskId: UIBackgroundTaskIdentifier = .invalid
+    // When true, ambiguous interruptions (no reason / unknown reason / iOS < 14.5) let the
+    // recording CONTINUE (rely on the engine auto-restart) instead of stopping. Set per
+    // startRecording from the JS layer (`recording.continue_on_ambiguous_interruption`), which
+    // keeps this remotely controllable. Default false → current (cautious-stop) behaviour.
+    private var continueOnAmbiguousInterruption: Bool = false
     private var isInterrupted: Bool = false
     private var wasInterruptedAndStopped: Bool = false // Tracks if we stopped recording due to interruption
     private var isMicrophoneCurrentlyAvailable: Bool = true
@@ -47,6 +58,7 @@ public class VoiceRecorder: CAPPlugin {
 
         let directory: String? = call.getString("directory")
         let subDirectory: String? = call.getString("subDirectory")
+        self.continueOnAmbiguousInterruption = call.getBool("continueOnAmbiguousInterruption") ?? false
 
         // Heavy work (audio session activation, Thread.sleep retries) runs off main thread
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -89,6 +101,7 @@ public class VoiceRecorder: CAPPlugin {
             if engineResult.success {
                 self.customMediaRecorder = engineRecorder
                 NSLog("VoiceRecorder: Recording started with AudioEngineRecorder")
+                self.beginRecordingBackgroundTask()
                 self.isInterrupted = false
                 self.wasInterruptedAndStopped = false
                 call.resolve([
@@ -131,6 +144,7 @@ public class VoiceRecorder: CAPPlugin {
             if recordingResult.success {
                 self.customMediaRecorder = legacyRecorder
                 NSLog("VoiceRecorder: Recording started with CustomMediaRecorder (fallback)")
+                self.beginRecordingBackgroundTask()
                 self.isInterrupted = false
                 self.wasInterruptedAndStopped = false
 
@@ -197,6 +211,10 @@ public class VoiceRecorder: CAPPlugin {
             return
         }
 
+        // Recording is ending — release the long-lived recording background task. The
+        // separate stop background task below covers the finalize/flush window.
+        endRecordingBackgroundTask()
+
         // Remove audio session interruption observer
         removeAudioSessionInterruptionHandling()
 
@@ -256,7 +274,9 @@ public class VoiceRecorder: CAPPlugin {
 
             if let engineRecorder = recorder as? AudioEngineRecorder {
                 diagnostics["recorderType"] = "engine"
-                diagnostics["conversion"] = engineRecorder.lastConversionResult.toDictionary()
+                // AAC is now encoded live from the tap (ADTS) — no separate PCM→AAC conversion
+                // step. Keep the `conversion.status` key populated for log continuity.
+                diagnostics["conversion"] = ["status": "streamed_adts"]
                 diagnostics["engine"] = engineRecorder.getDiagnostics()
             } else {
                 diagnostics["recorderType"] = "legacy"
@@ -394,6 +414,28 @@ public class VoiceRecorder: CAPPlugin {
 
 
     // MARK: - Audio Session Interruption Handling
+    //
+    // DESIGN NOTE — there are intentionally TWO interruption observers, on different planes.
+    // Do NOT "deduplicate" them by removing one; they cover different cases:
+    //
+    //  1. Per-recording observer (this section, `object: AVAudioSession.sharedInstance()`,
+    //     added in startRecording / removed in stopRecording). Plane: "should THIS active
+    //     recording stop?" — the smart decision via CallKit (real phone call → stop; WebView
+    //     video / background music → keep recording), mic-muted, etc. Exists only WHILE recording.
+    //
+    //  2. Global observer (`setupGlobalAudioSessionListener`, `object: nil`, alive from load()).
+    //     Plane: microphone-availability tracking even when we are NOT recording (so the app
+    //     learns when another app grabs/releases the mic → `microphoneAvailabilityChanged`),
+    //     route changes, and a deliberate BACKUP `interruptionEnded` for the case the
+    //     per-recording observer missed the `.ended` (e.g. it was already removed during stop).
+    //     Its guard `customMediaRecorder == nil || isInterrupted` means it does NOTHING during a
+    //     healthy active recording — no overlap there; the two planes only meet in the narrow
+    //     `interrupted → .ended` window, where the global one is an on-purpose safety net.
+    //
+    // The only artifact of that overlap is a possible double `interruptionEnded`, which the JS
+    // layer already tolerates (it guards re-entry / auto-resume). Removing the `|| isInterrupted`
+    // guard or deleting the global observer would reintroduce a missed-event window during stop —
+    // exactly what the backup was added to prevent (commit 79a196f "add interruption events").
 
     private func setupAudioSessionInterruptionHandling() {
         NotificationCenter.default.addObserver(
@@ -551,23 +593,26 @@ public class VoiceRecorder: CAPPlugin {
                     NSLog("VoiceRecorder: Interruption reason: microphone muted - stopping recording")
 
                 @unknown default:
-                    // Unknown reason - be cautious, STOP recording
-                    shouldStopRecording = true
-                    reason = "unknown"
-                    NSLog("VoiceRecorder: Interruption reason: unknown (%d) - stopping recording", reasonValue)
+                    // Unknown reason — ambiguous. Default: cautious STOP. With the engine
+                    // auto-restart in place, the app can opt to ride it through instead.
+                    shouldStopRecording = !continueOnAmbiguousInterruption
+                    reason = continueOnAmbiguousInterruption ? "unknown_continued" : "unknown"
+                    NSLog("VoiceRecorder: Interruption reason: unknown (%d) - %@", reasonValue,
+                          shouldStopRecording ? "stopping" : "continuing (ambiguous-continue enabled)")
                 }
             } else {
-                // No reason provided - be cautious, STOP recording
-                shouldStopRecording = true
-                reason = "no_reason_provided"
-                NSLog("VoiceRecorder: No interruption reason provided - stopping recording")
+                // No reason provided — ambiguous (see @unknown above).
+                shouldStopRecording = !continueOnAmbiguousInterruption
+                reason = continueOnAmbiguousInterruption ? "no_reason_continued" : "no_reason_provided"
+                NSLog("VoiceRecorder: No interruption reason provided - %@",
+                      shouldStopRecording ? "stopping" : "continuing (ambiguous-continue enabled)")
             }
         } else {
-            // iOS < 14.5 - no InterruptionReason API available
-            // Be cautious, STOP recording
-            shouldStopRecording = true
-            reason = "ios_version_too_old"
-            NSLog("VoiceRecorder: iOS < 14.5 - no interruption reason API available - stopping recording")
+            // iOS < 14.5 - no InterruptionReason API available — ambiguous (see @unknown above).
+            shouldStopRecording = !continueOnAmbiguousInterruption
+            reason = continueOnAmbiguousInterruption ? "ios_version_too_old_continued" : "ios_version_too_old"
+            NSLog("VoiceRecorder: iOS < 14.5 - no interruption reason API - %@",
+                  shouldStopRecording ? "stopping" : "continuing (ambiguous-continue enabled)")
         }
 
         // Send event ONLY if we're actually stopping the recording
@@ -666,6 +711,36 @@ public class VoiceRecorder: CAPPlugin {
         }
     }
 
+    // MARK: - Recording background task
+
+    /// Begin a background task held for the whole recording. UIApplication APIs must run on
+    /// the main thread (startRecording runs on a background queue), hence the dispatch.
+    private func beginRecordingBackgroundTask() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            // End any previous one first so we never leak across recordings.
+            if self.recordingBgTaskId != .invalid {
+                UIApplication.shared.endBackgroundTask(self.recordingBgTaskId)
+                self.recordingBgTaskId = .invalid
+            }
+            self.recordingBgTaskId = UIApplication.shared.beginBackgroundTask(withName: "VoiceRecorderActive") { [weak self] in
+                // Expiration: iOS is reclaiming the assertion. End it so we aren't force-killed
+                // for holding it; the `audio` background mode keeps the recording itself alive.
+                NSLog("VoiceRecorder: recording background task expired")
+                self?.endRecordingBackgroundTask()
+            }
+            NSLog("VoiceRecorder: recording background task begun (id=%lu)", UInt(self.recordingBgTaskId.rawValue))
+        }
+    }
+
+    private func endRecordingBackgroundTask() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.recordingBgTaskId != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(self.recordingBgTaskId)
+            self.recordingBgTaskId = .invalid
+        }
+    }
+
     // MARK: - Plugin Lifecycle
 
     public override func load() {
@@ -687,6 +762,10 @@ public class VoiceRecorder: CAPPlugin {
     }
 
     // MARK: - Global Audio Session Monitoring
+    //
+    // Second interruption plane — see the DESIGN NOTE above `setupAudioSessionInterruptionHandling`.
+    // This observer is the global / not-recording plane (mic availability, route changes) plus a
+    // deliberate `interruptionEnded` backup. It is NOT redundant with the per-recording observer.
 
     private func setupGlobalAudioSessionListener() {
         NotificationCenter.default.addObserver(
@@ -702,11 +781,38 @@ public class VoiceRecorder: CAPPlugin {
             name: AVAudioSession.routeChangeNotification,
             object: nil
         )
+
+        // mediaserverd can crash/reset; this invalidates the whole audio stack (session +
+        // engine), so an active recording cannot continue. Notify the JS layer so it stops,
+        // saves what was captured (the ADTS .aac is playable up to the reset) and may restart.
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMediaServicesWereReset(_:)),
+            name: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil
+        )
     }
 
     private func removeGlobalAudioSessionListener() {
         NotificationCenter.default.removeObserver(self, name: AVAudioSession.interruptionNotification, object: nil)
         NotificationCenter.default.removeObserver(self, name: AVAudioSession.routeChangeNotification, object: nil)
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
+    }
+
+    @objc private func handleMediaServicesWereReset(_ notification: Notification) {
+        NSLog("VoiceRecorder: mediaServicesWereReset — audio stack invalidated")
+        guard customMediaRecorder != nil else { return }
+
+        isInterrupted = true
+        var payload: [String: Any] = [
+            "reason": "media_services_reset",
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "source": "media_services_reset"
+        ]
+        for (k, v) in gatherInterruptionContext() { payload[k] = v }
+
+        NSLog("VoiceRecorder: Sending recordingInterrupted - reason: media_services_reset")
+        notifyListeners("recordingInterrupted", data: ["data": payload])
     }
 
     @objc private func handleGlobalAudioSessionInterruption(_ notification: Notification) {
