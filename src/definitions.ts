@@ -29,7 +29,7 @@ export interface RecordingData {
 }
 
 /**
- * iOS only. Configures the optional live audio stream that runs alongside (and never
+ * iOS and Android. Configures the optional live audio stream that runs alongside (and never
  * affects) the on-disk recording. The whole block travels with each `startRecording`
  * call, so multi-profile apps just pass a different server per call — there is no
  * persistent native-side server state. See docs/websocket-audio-streaming.md.
@@ -71,8 +71,8 @@ export type RecordingOptions =
       // iOS < 14.5) let the recording CONTINUE (relying on the native engine auto-restart)
       // instead of stopping. Default false. Drive from SettingsService for remote control.
       continueOnAmbiguousInterruption?: boolean;
-      // iOS only. When present, the recording is additionally streamed live as AAC ADTS
-      // frames over a WebSocket. Purely additive: streaming failures never affect the
+      // iOS and Android. When present, the recording is additionally streamed live as AAC
+      // ADTS frames over a WebSocket. Purely additive: streaming failures never affect the
       // recording or the saved file. Omit to disable (default).
       streaming?: StreamingOptions;
     };
@@ -136,7 +136,7 @@ export type RecordingStreamEventType =
   | 'finished';
 
 /**
- * iOS only. Lifecycle of the optional live WebSocket audio stream. Emitted via the
+ * iOS and Android. Lifecycle of the optional live WebSocket audio stream. Emitted via the
  * `recordingStreamEvent` listener so the app can log when streaming connected,
  * disconnected, reconnected, dropped frames, or errored. Never contains the token.
  */
@@ -221,7 +221,7 @@ export interface VoiceRecorderPlugin {
   ): Promise<PluginListenerHandle> & PluginListenerHandle;
 
   /**
-   * iOS only. Listen for live-streaming lifecycle events (WebSocket connect / disconnect /
+   * iOS and Android. Listen for live-streaming lifecycle events (WebSocket connect / disconnect /
    * reconnect / dropped frames / error / finished). Use these for logging streaming health.
    * These events never affect recording.
    */

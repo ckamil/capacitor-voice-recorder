@@ -1,6 +1,6 @@
 # WebSocket Live Audio Streaming — Integration Guide
 
-Status: **design / contract spec** (iOS only). This document describes how the
+Status: **design / contract spec** (iOS and Android). This document describes how the
 optional live audio stream works, what the app (frontend) must do, what the
 backend must implement, the event/logging contract, and how frame loss is
 handled. No behaviour changes unless a recording is started with a `streaming`
@@ -473,14 +473,24 @@ wss.on('connection', (socket, req) => {
 
 ---
 
-## 9. Scope & non-goals (v1)
+## 9. Scope, platforms & non-goals (v1)
 
-* **iOS only.** Android and the web stub ignore the `streaming` option.
-* **Engine path only.** The legacy `AVAudioRecorder` fallback does **not** stream
-  (it engages only when the audio engine fails to start). The file is still
-  recorded normally; no live stream is produced in that case. A
-  `recordingStreamEvent` of type `error`/`disconnected` is **not** emitted for
-  the legacy path — instead `diagnostics.streaming.enabled` is `false`.
+The same wire protocol, events, parameters and resilience apply to **iOS and
+Android**; only the audio-capture integration differs. The web stub ignores the
+`streaming` option.
+
+* **iOS** re-encodes the engine tap's PCM in parallel (`AVAudioConverter`) and
+  leaves the file (`ExtAudioFile`) untouched. It streams only on the engine path —
+  the legacy `AVAudioRecorder` fallback does **not** stream (the file is still
+  recorded; `diagnostics.streaming.enabled` is `false`, no stream events).
+* **Android** cannot read PCM or encoded frames from `MediaRecorder`, so it **tails
+  the ADTS file** MediaRecorder writes (the file is left untouched), splits it on
+  ADTS frame boundaries and streams the identical `[seq][tsMs][frame]` format.
+  Consequence: live latency depends on MediaRecorder's flush cadence (can be up to
+  ~1 s) — still best-effort. `sampleRate`/`channels` are read from the first ADTS
+  frame. Requires the `INTERNET` + `ACCESS_NETWORK_STATE` permissions (added to the
+  plugin manifest) and the OkHttp dependency. Keepalive is OkHttp's built-in
+  `pingInterval`; reachability uses `ConnectivityManager`.
 * **No live gap backfill.** Gaps during an outage are not re-sent in v1; reconcile
   from the final file if needed (see §5).
 
