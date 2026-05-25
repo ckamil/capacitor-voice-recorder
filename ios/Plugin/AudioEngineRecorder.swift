@@ -15,6 +15,17 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     private var isPaused = false
     private let writeQueue = DispatchQueue(label: "com.capacitor.voicerecorder.enginewriter")
 
+    // Optional live WebSocket stream — additive, never affects the file. The encoder + sink run on
+    // their own queue so a slow/failing network cannot delay the file writes on writeQueue.
+    // Set by VoiceRecorder before startRecording so streaming lifecycle events reach the JS layer.
+    var onStreamEvent: (([String: Any]) -> Void)?
+    private var streamEncoder: AacAdtsStreamEncoder?
+    private var streamSink: AudioStreamSink?
+    private let streamQueue = DispatchQueue(label: "com.capacitor.voicerecorder.streamencode")
+    private var streamSeq: UInt32 = 0               // mutated only on streamQueue
+    private var streamFramesEnqueued: UInt64 = 0    // mutated only on streamQueue (AAC frames sent to sink)
+    private var lastStreamingDiagnostics: [String: Any]?
+
     // Fixed tap/encoder PCM format, kept so the tap can be re-installed after an engine
     // configuration change (route/sample-rate change) without breaking the AAC client format.
     private var recordingFormat: AVAudioFormat?
@@ -96,6 +107,11 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         pausedTotalMs = 0
         engineRestartCount = 0
         activationErrorsForDiagnostics = []
+        streamSeq = 0
+        streamFramesEnqueued = 0
+        streamEncoder = nil
+        streamSink = nil
+        lastStreamingDiagnostics = nil
 
         do {
             options = recordOptions
@@ -261,6 +277,10 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             engineStartedAt = Date()
             activationErrorsForDiagnostics = activationErrors
 
+            // Optional, additive: start the live stream once the engine is confirmed running.
+            // Any failure here only disables streaming — the recording is already live.
+            setupStreamingIfNeeded(pcmFormat: recordingFormat)
+
             NSLog("AudioEngineRecorder: Recording started (sampleRate=%.0f, channels=%d, format=%@)",
                   inputFormat.sampleRate, inputFormat.channelCount,
                   inputFormat.description)
@@ -380,6 +400,25 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
                     NSLog("AudioEngineRecorder: Failed to encode AAC buffer: %d", st)
                 }
             }
+
+            // Additive live stream: encode + enqueue on a SEPARATE queue so a slow/failing
+            // network never delays the file writes above. Skipped while paused (like the file).
+            if self.streamSink != nil {
+                self.streamQueue.async {
+                    guard !self.isPaused,
+                          let encoder = self.streamEncoder,
+                          let sink = self.streamSink else { return }
+                    let frames = encoder.encode(buffer)
+                    guard !frames.isEmpty else { return }
+                    let rate = fmt.sampleRate > 0 ? fmt.sampleRate : 48000
+                    for frame in frames {
+                        let tsMs = UInt32((Double(self.streamFramesEnqueued) * 1024.0 / rate * 1000.0).rounded())
+                        sink.enqueue(seq: self.streamSeq, timestampMs: tsMs, adts: frame)
+                        self.streamSeq = self.streamSeq &+ 1
+                        self.streamFramesEnqueued &+= 1
+                    }
+                }
+            }
         }
     }
 
@@ -444,6 +483,19 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             }
         }
         NSLog("AudioEngineRecorder: stop [E] AAC finalized")
+
+        // Finish the live stream (if any). The tap is already removed, so streamQueue.sync acts as
+        // a barrier draining the last encodes before we read the final frame count and close.
+        if let sink = streamSink {
+            var totalFrames: UInt64 = 0
+            streamQueue.sync { totalFrames = self.streamFramesEnqueued }
+            let rate = inputSampleRate > 0 ? inputSampleRate : 48000
+            let msDuration = Int((Double(totalFrames) * 1024.0 / rate * 1000.0).rounded())
+            sink.finish(framesEnqueued: totalFrames, msDuration: msDuration)
+            lastStreamingDiagnostics = sink.diagnosticsSnapshot()
+            streamSink = nil
+            streamEncoder = nil
+        }
 
         // Restore audio session — retry deactivation to prevent orphaned .playAndRecord
         NSLog("AudioEngineRecorder: stop [H] restoring audio session")
@@ -566,11 +618,59 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         return diag
     }
 
+    // MARK: - Streaming (optional, additive)
+
+    /// Final streaming diagnostics, captured at stopRecording. nil when streaming was not requested.
+    func streamingDiagnostics() -> [String: Any]? {
+        return lastStreamingDiagnostics
+    }
+
+    /// Build the AAC encoder + WebSocket sink for the live stream. Best-effort: on any failure the
+    /// stream is simply disabled (recording continues; file is unaffected).
+    private func setupStreamingIfNeeded(pcmFormat: AVAudioFormat) {
+        guard let cfg = options.streaming else { return }
+
+        guard let encoder = AacAdtsStreamEncoder(pcmFormat: pcmFormat) else {
+            lastStreamingDiagnostics = ["enabled": true, "finalState": "encoder_init_failed"]
+            onStreamEvent?(streamEvent([
+                "type": "error",
+                "reason": "encoder_init_failed",
+                "message": "Unable to initialise AAC encoder for streaming"
+            ]))
+            NSLog("AudioEngineRecorder: streaming disabled — AAC encoder init failed")
+            return
+        }
+
+        lastStreamingDiagnostics = ["enabled": true, "finalState": "init"]
+        let sink = AudioStreamSink(
+            config: cfg,
+            sampleRate: pcmFormat.sampleRate,
+            channels: Int(pcmFormat.channelCount),
+            recordingId: UUID().uuidString
+        ) { [weak self] event in
+            self?.onStreamEvent?(event)
+        }
+        streamEncoder = encoder
+        streamSink = sink
+        sink.start()
+    }
+
+    private func streamEvent(_ payload: [String: Any]) -> [String: Any] {
+        var enriched = payload
+        enriched["timestamp"] = ISO8601DateFormatter().string(from: Date())
+        return enriched
+    }
+
     // MARK: - Cleanup
 
     private func cleanupAfterFailedStart() {
         NSLog("AudioEngineRecorder: cleanupAfterFailedStart")
         removeEngineConfigObserver()
+        if let sink = streamSink {
+            sink.cancel()
+            streamSink = nil
+            streamEncoder = nil
+        }
         if let engine = audioEngine {
             engine.inputNode.removeTap(onBus: 0)
             engine.stop()

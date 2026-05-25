@@ -59,6 +59,7 @@ public class VoiceRecorder: CAPPlugin {
         let directory: String? = call.getString("directory")
         let subDirectory: String? = call.getString("subDirectory")
         self.continueOnAmbiguousInterruption = call.getBool("continueOnAmbiguousInterruption") ?? false
+        let streamingOptions = parseStreamingOptions(call)
 
         // Heavy work (audio session activation, Thread.sleep retries) runs off main thread
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -92,10 +93,15 @@ public class VoiceRecorder: CAPPlugin {
             // Setup audio session interruption handling
             self.setupAudioSessionInterruptionHandling()
 
-            let recordOptions = RecordOptions(directory: directory, subDirectory: subDirectory)
+            let recordOptions = RecordOptions(directory: directory, subDirectory: subDirectory, streaming: streamingOptions)
 
             // Try AVAudioEngine first, fall back to AVAudioRecorder if Engine fails.
             let engineRecorder = AudioEngineRecorder()
+            // Forward live-streaming lifecycle events to the JS layer for logging. Set before
+            // startRecording so connect/error events emitted during setup are delivered.
+            engineRecorder.onStreamEvent = { [weak self] event in
+                self?.notifyListeners("recordingStreamEvent", data: event)
+            }
             let engineResult = engineRecorder.startRecording(recordOptions: recordOptions)
 
             if engineResult.success {
@@ -278,6 +284,9 @@ public class VoiceRecorder: CAPPlugin {
                 // step. Keep the `conversion.status` key populated for log continuity.
                 diagnostics["conversion"] = ["status": "streamed_adts"]
                 diagnostics["engine"] = engineRecorder.getDiagnostics()
+                if let streaming = engineRecorder.streamingDiagnostics() {
+                    diagnostics["streaming"] = streaming
+                }
             } else {
                 diagnostics["recorderType"] = "legacy"
                 let extra = recorder.getDiagnostics()
@@ -410,6 +419,54 @@ public class VoiceRecorder: CAPPlugin {
             return -1
         }
         return Int(CMTimeGetSeconds(AVURLAsset(url: filePath!).duration) * 1000)
+    }
+
+    // MARK: - Streaming options
+
+    /// Parse the optional `streaming` object from startRecording. Returns nil (streaming disabled)
+    /// when absent or when the URL is missing/invalid. The whole block is read per call, so each
+    /// recording connects to whatever server the active profile passed.
+    private func parseStreamingOptions(_ call: CAPPluginCall) -> StreamingConfig? {
+        guard let obj = call.getObject("streaming") else { return nil }
+        guard let urlString = obj["url"] as? String, let url = URL(string: urlString) else {
+            NSLog("VoiceRecorder: streaming option present but url missing/invalid — streaming disabled")
+            return nil
+        }
+
+        let token = obj["token"] as? String
+
+        var headers: [String: String] = [:]
+        if let rawHeaders = obj["headers"] as? JSObject {
+            for (key, value) in rawHeaders {
+                if let stringValue = value as? String { headers[key] = stringValue }
+            }
+        }
+
+        var configPayload: [String: Any] = [:]
+        if let rawConfig = obj["config"] as? JSObject {
+            for (key, value) in rawConfig { configPayload[key] = value }
+        }
+
+        let reconnect = obj["reconnect"] as? JSObject
+        let initialDelayMs = (reconnect?["initialDelayMs"] as? Int) ?? 1000
+        let maxDelayMs = (reconnect?["maxDelayMs"] as? Int) ?? 8000
+        let maxAttempts = (reconnect?["maxAttempts"] as? Int) ?? 0
+        let maxBufferSeconds = (obj["maxBufferSeconds"] as? Double) ?? 10
+        let pingIntervalMs = (obj["pingIntervalMs"] as? Int) ?? 20000
+        let requireReachability = (obj["requireReachability"] as? Bool) ?? true
+
+        return StreamingConfig(
+            url: url,
+            token: token,
+            headers: headers,
+            config: configPayload,
+            reconnectInitialDelayMs: initialDelayMs,
+            reconnectMaxDelayMs: maxDelayMs,
+            reconnectMaxAttempts: maxAttempts,
+            maxBufferSeconds: maxBufferSeconds,
+            pingIntervalMs: pingIntervalMs,
+            requireReachability: requireReachability
+        )
     }
 
 

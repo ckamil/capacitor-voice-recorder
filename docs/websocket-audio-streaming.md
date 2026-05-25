@@ -76,9 +76,25 @@ await VoiceRecorder.startRecording({
       sessionToken: '<login session token>',
       language: 'pl-PL',
     },
+    // All of the following are optional and have safe defaults:
+    reconnect: { initialDelayMs: 1000, maxDelayMs: 8000, maxAttempts: 0 }, // 0 = unlimited
+    maxBufferSeconds: 10,        // audio buffered while offline before dropping oldest frames
+    pingIntervalMs: 20000,       // keepalive ping; 0 disables
+    requireReachability: true,   // gate attempts on OS network reachability (NWPathMonitor)
   },
 });
 ```
+
+### Tuning (all optional)
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `reconnect.initialDelayMs` | `1000` | Delay before the first reconnect attempt. |
+| `reconnect.maxDelayMs` | `8000` | Backoff cap (exponential: 1s → 2s → 4s → 8s …). |
+| `reconnect.maxAttempts` | `0` | Attempts before giving up; `0` = unlimited (retry for the whole recording). |
+| `maxBufferSeconds` | `10` | Seconds of audio buffered while disconnected before the oldest frames are dropped. |
+| `pingIntervalMs` | `20000` | WebSocket keepalive ping interval; `0` disables. |
+| `requireReachability` | `true` | Only attempt/await connections while the OS reports a network path. |
 
 ### Multi-profile
 
@@ -181,41 +197,97 @@ outage. This is **advisory only** — the authoritative gap signal is the jump i
 { "type": "gap", "fromSeq": 100, "toSeq": 137, "droppedFrames": 37, "reason": "buffer_overflow" }
 ```
 
-### 4.6 Server → client (optional, future)
+### 4.6 Server → client (text/JSON)
 
-The connection is bidirectional. A server may push text/JSON (e.g. partial
-transcripts). The v1 client does not require any server→client message; such
-messages are currently ignored by the plugin. Reserved for a future
-"live transcript" surface.
+The connection is bidirectional. A server **may** push text/JSON. The v1 client
+acts on exactly one case, to avoid wasting bandwidth/battery when the server has
+rejected the stream at the application level:
+
+```json
+{ "type": "error", "reason": "invalid_session" }   // or { "type": "close" }
+```
+
+On receiving `type: "error"` or `type: "close"`, the client treats streaming as
+**fatal**: it stops sending, does **not** reconnect for the rest of the
+recording, and emits a terminal `error` event (`reason: "server_<reason>"`). Any
+other server→client message is currently ignored (reserved for a future
+"live transcript" surface). Recording and the saved file are unaffected.
 
 ### 4.7 Keepalive
 
-`URLSessionWebSocketTask` handles WebSocket ping/pong. The server should tolerate
-standard ping frames and not treat an idle control channel (audio still flowing
-as binary) as dead.
+The client sends WebSocket pings every `pingIntervalMs` (default 20 s; `0`
+disables) to detect dead/half-open connections and keep NAT mappings alive. A
+failed ping triggers a reconnect. The server should respond to pings and must not
+treat an idle control channel (while audio still flows as binary) as dead.
 
 ---
 
-## 5. Resilience — what happens when the server is temporarily down
+## 5. Resilience — connect, disconnect, retry, background
 
 This is the concrete behaviour behind principle #1/#2.
 
-* **Bounded in-memory buffer.** ADTS frames are queued in a ring buffer capped to
-  a small window (a few seconds of audio / a few MB). The cap protects memory
-  during an outage.
-* **Drop-oldest on overflow.** If the outage outlasts the buffer, the **oldest**
-  frames are dropped (so live latency stays bounded and memory never grows
-  without limit). Dropped frames are accounted for and reported (§7).
-* **Reconnect with exponential backoff.** On disconnect the sender reconnects
-  with backoff (1s → 2s → 4s → 8s, capped). On reconnect it replays a fresh
-  `start` and flushes whatever is still buffered.
-* **Recording is unaffected.** The file keeps being written throughout. When the
-  socket is down, only the *live* transcript has a gap; the complete audio is on
-  disk and can be uploaded/transcribed afterwards to fill any gap.
+### 5.1 Buffering (don't lose frames)
+
+* **Bounded buffer.** ADTS frames are queued in a FIFO sized to `maxBufferSeconds`
+  (default 10 s, derived to a frame count from the sample rate). Frames produced
+  while connecting/reconnecting are buffered and flushed on connect — not lost.
+* **Drop-oldest on overflow.** If an outage outlasts the buffer, the **oldest**
+  frames are dropped so memory stays bounded and live latency does not grow. Drops
+  are counted, reported via `dropped` events (§7), and visible to the server as a
+  `seq` jump (§6).
+* **In-flight frame is never lost.** If a send fails, the frame is re-queued at the
+  front before reconnecting.
+* **Flush on stop.** On `stopRecording` the client drains remaining buffered frames
+  (bounded, ~3 s) before sending `end` and closing.
+
+### 5.2 Reconnect — timer-driven, never per-frame
+
+* Reconnect is driven by a **single backoff timer**, never by incoming frames.
+  While disconnected, frames only accumulate in the buffer; they do **not** each
+  trigger a connection attempt.
+* Exponential backoff from `reconnect.initialDelayMs` doubling up to
+  `reconnect.maxDelayMs` (default 1s → 2s → 4s → 8s …). Gives up after
+  `reconnect.maxAttempts` (default `0` = unlimited, i.e. for the whole recording).
+
+### 5.3 Reachability (don't retry into a dead network)
+
+* An `NWPathMonitor` tracks network availability. With `requireReachability: true`
+  (default), the client does **not** burn reconnect attempts while offline — it
+  parks in a `waiting_network` state.
+* When the path returns, it reconnects **immediately** and resets the backoff
+  (emits `reconnecting` with `reason: "network_restored"`). A lost path while
+  connected proactively drops the socket and parks until the network is back.
+
+### 5.4 Error classification (don't send when the server rejects us)
+
+Not every failure is worth retrying:
+
+* **Retryable → backoff reconnect:** network errors, timeouts, HTTP `408`/`429`,
+  HTTP `5xx`, abnormal/`going-away` closes, ping failures.
+* **Fatal → stop, no reconnect:** HTTP `4xx` auth/bad-request (`401`, `403`, `400`,
+  `404`, …), WebSocket policy/protocol closes, a normal server-initiated close, or
+  a server→client `{type:"error"|"close"}` (§4.6). The client emits a terminal
+  `error` event and stops streaming for the rest of the recording.
+
+In all cases the recording and the saved file are unaffected.
+
+### 5.5 Background operation
+
+Streaming **must and does** continue when the app is backgrounded:
+
+* It rides on the recording's existing `audio` background mode + background task —
+  while a recording is active the app process stays alive, so the WebSocket,
+  `NWPathMonitor`, backoff timers and pings keep running in the background.
+* It deliberately uses a **`.default`** `URLSession`. WebSocket tasks are **not**
+  supported on background-configuration sessions, and they are not needed here:
+  the audio background mode is the keep-alive.
+* The stop sequence (drain + `end` + close) runs inside the plugin's
+  `stopRecording` background task, so it completes even if the app is in the
+  background when the user stops.
 
 **Mental model:** live stream = best-effort, low-latency, may have gaps during
-outages. Final file = guaranteed complete. Reconcile the two on the backend if
-exact, gap-free transcripts are required.
+outages or after a fatal rejection. Final file = guaranteed complete. Reconcile
+the two on the backend if exact, gap-free transcripts are required.
 
 > Possible future enhancement (not in v1): on reconnect, backfill the missed
 > byte range from the on-disk file so the server can close live gaps. Deferred to
@@ -288,24 +360,32 @@ export interface RecordingStreamEvent {
   type:
     | 'connecting'     // opening the socket
     | 'connected'      // socket open + `start` sent
-    | 'reconnecting'   // dropped, retrying (see attempt/backoffMs)
+    | 'reconnecting'   // retrying (see attempt/backoffMs/reason)
     | 'disconnected'   // socket closed (see code/reason)
-    | 'error'          // a streaming error occurred (recording continues)
+    | 'error'          // a streaming error occurred; may be terminal (see reason)
     | 'dropped'        // frames dropped due to buffer overflow
     | 'finished';      // clean end after stopRecording (`end` sent + closed)
   timestamp: string;          // ISO-8601
   host?: string;              // server host only (never the token / full URL with creds)
-  attempt?: number;           // reconnecting: 1-based attempt number
+  attempt?: number;           // reconnecting: 1-based attempt number (0 = immediate, e.g. network restored)
   backoffMs?: number;         // reconnecting: delay before this attempt
-  code?: number;              // disconnected: WebSocket close code
-  reason?: string;            // disconnected / error / dropped: short reason
+  code?: number;              // disconnected/error: WebSocket close code or HTTP status
+  reason?: string;            // disconnected / error / reconnecting / dropped: short machine reason
   message?: string;           // error: human-readable description
-  droppedFrames?: number;     // dropped: how many frames were discarded
+  droppedFrames?: number;     // dropped: cumulative frames discarded
   framesSent?: number;        // finished: total frames sent
   bytesSent?: number;         // finished: total bytes sent
   reconnects?: number;        // finished: number of reconnects during the session
 }
 ```
+
+`reason` values you may see: `no_network`, `network_restored`, `ping`, `receive`,
+`send`, `connect`, `start_send`, `close_<code>` (WebSocket close), `http_<status>`,
+`max_attempts`, `server_rejected`, `server_<reason>` (from §4.6), `start_serialize`.
+
+A **terminal `error`** (reason `server_rejected`, `server_<reason>`, `max_attempts`
+or `start_serialize`) means streaming has stopped for the rest of the recording —
+no further reconnects. Everything else is transient.
 
 ### Guarantees
 
@@ -314,9 +394,13 @@ export interface RecordingStreamEvent {
   server host for correlation; the full URL with credentials is not emitted.
 * The minimum guaranteed sequence for a healthy recording is:
   `connecting → connected → … → finished`.
-* An outage looks like:
+* A transient outage looks like:
   `connected → disconnected → reconnecting(attempt=1) → … → connected → finished`,
   with `dropped` events in between if the buffer overflowed.
+* An offline stretch looks like:
+  `disconnected(reason="no_network") → … → reconnecting(reason="network_restored", attempt=0) → connected`.
+* `finalState` in the diagnostics block (and the absence of `finished`) reflects a
+  terminal state such as `fatal` when the server rejected the stream.
 
 ### End-of-recording summary (diagnostics)
 
