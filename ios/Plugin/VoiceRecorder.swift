@@ -7,7 +7,27 @@ import UIKit
 @objc(VoiceRecorder)
 public class VoiceRecorder: CAPPlugin {
 
-    private var customMediaRecorder: RecorderInterface?
+    // `customMediaRecorder` is touched from several threads: the plugin's call queue, the
+    // global queue that startRecording/stopRecording offload their heavy work to, and the
+    // audio-session notification thread (interruption / route-change / media-reset observers).
+    // Concurrently reading the reference while another thread reassigns it is an ARC data race
+    // (use-after-free / over-release). Guard the pointer with a lock. The lock only protects
+    // the reference itself — callers read it into a local strong ref, which keeps the object
+    // alive for the duration of the call even if the property is set to nil meanwhile.
+    private var _customMediaRecorder: RecorderInterface?
+    private let recorderLock = NSLock()
+    private var customMediaRecorder: RecorderInterface? {
+        get {
+            recorderLock.lock()
+            defer { recorderLock.unlock() }
+            return _customMediaRecorder
+        }
+        set {
+            recorderLock.lock()
+            defer { recorderLock.unlock() }
+            _customMediaRecorder = newValue
+        }
+    }
     // Held for the whole duration of an active recording so iOS treats the app as doing
     // important work and is less likely to suspend it in the background. The `audio`
     // background mode is the primary keep-alive; this is a belt-and-suspenders that also
@@ -171,6 +191,10 @@ public class VoiceRecorder: CAPPlugin {
             }
 
             self.customMediaRecorder = nil
+            // Both engine and legacy failed: balance the observer registered before the start
+            // attempt. Without this a failed start leaks the per-recording interruption observer
+            // (and the next successful recording would emit duplicate interruption events).
+            self.removeAudioSessionInterruptionHandling()
 
             var errorDetails: [String: Any] = [
                 "requestedDirectory": directory ?? "DOCUMENTS",
@@ -218,11 +242,11 @@ public class VoiceRecorder: CAPPlugin {
         // Remove audio session interruption observer
         removeAudioSessionInterruptionHandling()
 
-        // Begin background task so iOS gives us up to ~30 s (or more, depending on iOS
-        // policy) to finish PCM→AAC conversion + base64 encoding even when the app has
-        // moved to the background between the user pressing stop and the conversion
-        // finishing. Without this, iOS may suspend the process mid-conversion and the
-        // .aac file is left without a finalized header → app layer sees file_missing.
+        // Begin background task so iOS gives us time to finalize the recording (flush the
+        // trailing AAC packet via ExtAudioFileDispose), read its duration and base64-encode it,
+        // even when the app has moved to the background between the user pressing stop and the
+        // work finishing. Without this, iOS may suspend the process mid-finalize and the .aac
+        // file is left without a finalized trailer → app layer sees file_missing / empty.
         let bgTaskId = UIApplication.shared.beginBackgroundTask(withName: "VoiceRecorderStop") {
             NSLog("VoiceRecorder: stopRecording background task expired before completion")
         }
@@ -230,8 +254,8 @@ public class VoiceRecorder: CAPPlugin {
         NSLog("VoiceRecorder: stopRecording [1] dispatching to background (bgTaskId=%lu)",
               UInt(bgTaskId.rawValue))
 
-        // Heavy work (PCM→AAC conversion, base64 encoding) must run off the main thread
-        // to avoid freezing the UI.
+        // Heavy work (file finalize/flush, duration read, base64 encoding) must run off the
+        // main thread to avoid freezing the UI.
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             defer {
                 if bgTaskId != .invalid {
