@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import AudioToolbox
 import UIKit
 
 class AudioEngineRecorder: NSObject, RecorderInterface {
@@ -389,7 +390,13 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     /// into the SAME open AAC file. Best-effort: if restart fails the recording ends at the
     /// change point (no worse than before this handler existed).
     private func handleEngineConfigurationChange() {
-        guard status == CurrentRecordingStatus.RECORDING, let engine = audioEngine else { return }
+        // Restart while RECORDING *or* PAUSED: pause does not stop the engine (it only drops
+        // buffers via isPaused), so a route/format change during a pause would otherwise leave
+        // the engine stopped — and resumeRecording does not restart it — making the rest of the
+        // recording silent after resume. Keeping the engine alive while paused writes nothing
+        // (the tap still honours isPaused) but means resume has a live engine to capture into.
+        guard status == CurrentRecordingStatus.RECORDING || status == CurrentRecordingStatus.PAUSED,
+              let engine = audioEngine else { return }
         if engine.isRunning { return } // engine survived the change — nothing to do
         NSLog("AudioEngineRecorder: configuration change — engine stopped, attempting restart")
         try? recordingSession?.setActive(true)
