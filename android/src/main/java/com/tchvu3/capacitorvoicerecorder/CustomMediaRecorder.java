@@ -4,8 +4,10 @@ import android.content.Context;
 import android.media.MediaRecorder;
 import android.os.Build;
 import android.os.Environment;
+import com.getcapacitor.JSObject;
 import java.io.File;
 import java.io.IOException;
+import java.util.UUID;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -16,6 +18,12 @@ public class CustomMediaRecorder {
     private MediaRecorder mediaRecorder;
     private File outputFile;
     private CurrentRecordingStatus currentRecordingStatus = CurrentRecordingStatus.NONE;
+
+    // Optional live WebSocket stream — additive, never touches the MediaRecorder file path.
+    private AudioStreamSink streamSink;
+    private AdtsStreamReader streamReader;
+    private AudioStreamSink.EventListener streamEventListener;
+    private JSObject streamingDiagnostics;
 
     public CustomMediaRecorder(Context context, RecordOptions options) throws IOException {
         android.util.Log.d("CustomMediaRecorder", "Constructor called");
@@ -114,6 +122,7 @@ public class CustomMediaRecorder {
             mediaRecorder.start();
             currentRecordingStatus = CurrentRecordingStatus.RECORDING;
             android.util.Log.d("CustomMediaRecorder", "Recording started successfully");
+            startStreamingIfNeeded();
         } catch (Exception e) {
             android.util.Log.e("CustomMediaRecorder", "CANNOT_RECORD - MediaRecorder.start() failed: " + e.getMessage());
             throw e;
@@ -121,9 +130,76 @@ public class CustomMediaRecorder {
     }
 
     public void stopRecording() {
-        mediaRecorder.stop();
-        mediaRecorder.release();
-        currentRecordingStatus = CurrentRecordingStatus.NONE;
+        try {
+            mediaRecorder.stop();
+            mediaRecorder.release();
+        } finally {
+            currentRecordingStatus = CurrentRecordingStatus.NONE;
+            stopStreaming();
+        }
+    }
+
+    public void setStreamEventListener(AudioStreamSink.EventListener listener) {
+        this.streamEventListener = listener;
+    }
+
+    public JSObject getStreamingDiagnostics() {
+        return streamingDiagnostics;
+    }
+
+    private void startStreamingIfNeeded() {
+        StreamingConfig sc = options.getStreaming();
+        if (sc == null || streamEventListener == null) {
+            return;
+        }
+        try {
+            streamingDiagnostics = null;
+            streamSink = new AudioStreamSink(context, sc, UUID.randomUUID().toString(), streamEventListener);
+            streamReader = new AdtsStreamReader(
+                outputFile,
+                new AdtsStreamReader.FrameListener() {
+                    @Override
+                    public void onFrame(long seq, long timestampMs, byte[] adtsFrame) {
+                        if (streamSink != null) streamSink.enqueue(seq, timestampMs, adtsFrame);
+                    }
+
+                    @Override
+                    public void onFormat(int sampleRate, int channels) {
+                        if (streamSink != null) streamSink.setFormat(sampleRate, channels);
+                    }
+                }
+            );
+            streamSink.start();
+            streamReader.start();
+        } catch (Exception e) {
+            android.util.Log.e("CustomMediaRecorder", "Streaming disabled — failed to start: " + e.getMessage());
+            streamSink = null;
+            streamReader = null;
+        }
+    }
+
+    private void stopStreaming() {
+        if (streamReader != null) {
+            long frames = 0;
+            int sampleRate = 44100;
+            try {
+                streamReader.stopAndFlush();
+            } finally {
+                frames = streamReader.getFrameCount();
+                sampleRate = streamReader.getSampleRate();
+                streamReader = null;
+            }
+            if (streamSink != null) {
+                long msDuration = sampleRate > 0 ? (frames * 1024L * 1000L) / sampleRate : 0;
+                streamSink.finish(msDuration);
+                streamingDiagnostics = streamSink.diagnosticsSnapshot();
+                streamSink = null;
+            }
+        } else if (streamSink != null) {
+            streamSink.cancel();
+            streamingDiagnostics = streamSink.diagnosticsSnapshot();
+            streamSink = null;
+        }
     }
 
     public File getOutputFile() {

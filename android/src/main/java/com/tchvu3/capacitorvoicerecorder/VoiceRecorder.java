@@ -104,7 +104,11 @@ public class VoiceRecorder extends Plugin {
             String directory = call.getString("directory");
             String subDirectory = call.getString("subDirectory");
             RecordOptions options = new RecordOptions(directory, subDirectory);
+            options.setStreaming(StreamingConfig.fromJSObject(call.getObject("streaming")));
             mediaRecorder = new CustomMediaRecorder(getContext(), options);
+            // Forward live-streaming lifecycle events to JS for logging. Set before startRecording
+            // so connect/error events emitted during setup are delivered.
+            mediaRecorder.setStreamEventListener(event -> notifyListeners("recordingStreamEvent", event));
             mediaRecorder.startRecording();
             isInterrupted = false;
             wasInterruptedAndStopped = false;
@@ -129,6 +133,7 @@ public class VoiceRecorder extends Plugin {
 
         try {
             mediaRecorder.stopRecording();
+            JSObject streamingDiagnostics = mediaRecorder.getStreamingDiagnostics();
             File recordedFile = mediaRecorder.getOutputFile();
             RecordOptions options = mediaRecorder.getRecordOptions();
 
@@ -150,6 +155,7 @@ public class VoiceRecorder extends Plugin {
                 path
             );
             recordData.setFileSize(recordedFile.length());
+            recordData.setStreamingDiagnostics(streamingDiagnostics);
             if ((recordDataBase64 == null && path == null) || recordData.getMsDuration() < 0) {
                 call.reject(Messages.EMPTY_RECORDING);
             } else {

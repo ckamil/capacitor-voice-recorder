@@ -28,6 +28,40 @@ export interface RecordingData {
   };
 }
 
+/**
+ * iOS and Android. Configures the optional live audio stream that runs alongside (and never
+ * affects) the on-disk recording. The whole block travels with each `startRecording`
+ * call, so multi-profile apps just pass a different server per call — there is no
+ * persistent native-side server state. See docs/websocket-audio-streaming.md.
+ */
+export interface StreamingReconnectOptions {
+  /** Delay before the first reconnect attempt, in ms. Default 1000. */
+  initialDelayMs?: number;
+  /** Maximum backoff delay between attempts, in ms (exponential, capped here). Default 8000. */
+  maxDelayMs?: number;
+  /** Max reconnect attempts before giving up for this recording. 0 = unlimited. Default 0. */
+  maxAttempts?: number;
+}
+
+export interface StreamingOptions {
+  /** WebSocket URL of the transcription/audio server for the active profile. `wss://` required. */
+  url: string;
+  /** Optional bearer token; sent as `Authorization: Bearer <token>` on the upgrade request. Never logged. */
+  token?: string;
+  /** Optional extra headers added to the WebSocket upgrade request. */
+  headers?: Record<string, string>;
+  /** Arbitrary, JSON-serializable app/profile payload forwarded verbatim in the `start` control message. */
+  config?: Record<string, any>;
+  /** Reconnect / backoff tuning. */
+  reconnect?: StreamingReconnectOptions;
+  /** Seconds of audio buffered while disconnected before the oldest frames are dropped. Default 10. */
+  maxBufferSeconds?: number;
+  /** WebSocket keepalive ping interval in ms; detects dead connections. 0 disables. Default 20000. */
+  pingIntervalMs?: number;
+  /** When true (default), only attempt/await connections while the OS reports network reachability. */
+  requireReachability?: boolean;
+}
+
 export type RecordingOptions =
   | never
   | {
@@ -37,6 +71,10 @@ export type RecordingOptions =
       // iOS < 14.5) let the recording CONTINUE (relying on the native engine auto-restart)
       // instead of stopping. Default false. Drive from SettingsService for remote control.
       continueOnAmbiguousInterruption?: boolean;
+      // iOS and Android. When present, the recording is additionally streamed live as AAC
+      // ADTS frames over a WebSocket. Purely additive: streaming failures never affect the
+      // recording or the saved file. Omit to disable (default).
+      streaming?: StreamingOptions;
     };
 
 export interface GenericResponse {
@@ -79,7 +117,53 @@ export interface InterruptionEndedEvent {
 
 export interface MicrophoneAvailabilityEvent {
   available: boolean;
-  reason?: 'system_available' | 'other_app_finished' | 'phone_call_ended' | 'system_unavailable' | 'other_app_started' | 'phone_call_started';
+  reason?:
+    | 'system_available'
+    | 'other_app_finished'
+    | 'phone_call_ended'
+    | 'system_unavailable'
+    | 'other_app_started'
+    | 'phone_call_started';
+}
+
+export type RecordingStreamEventType =
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'disconnected'
+  | 'error'
+  | 'dropped'
+  | 'finished';
+
+/**
+ * iOS and Android. Lifecycle of the optional live WebSocket audio stream. Emitted via the
+ * `recordingStreamEvent` listener so the app can log when streaming connected,
+ * disconnected, reconnected, dropped frames, or errored. Never contains the token.
+ */
+export interface RecordingStreamEvent {
+  type: RecordingStreamEventType;
+  /** ISO-8601 timestamp of the event. */
+  timestamp: string;
+  /** Server host (for correlation); never the full URL with credentials. */
+  host?: string;
+  /** `reconnecting`: 1-based attempt number. */
+  attempt?: number;
+  /** `reconnecting`: delay in ms before this attempt. */
+  backoffMs?: number;
+  /** `disconnected`: WebSocket close code. */
+  code?: number;
+  /** `disconnected` / `error` / `dropped`: short machine reason. */
+  reason?: string;
+  /** `error`: human-readable description. */
+  message?: string;
+  /** `dropped`: cumulative frames discarded due to buffer overflow. */
+  droppedFrames?: number;
+  /** `finished`: total frames sent over the session. */
+  framesSent?: number;
+  /** `finished`: total bytes sent over the session. */
+  bytesSent?: number;
+  /** `finished`: number of reconnects during the session. */
+  reconnects?: number;
 }
 
 export interface VoiceRecorderPlugin {
@@ -134,6 +218,16 @@ export interface VoiceRecorderPlugin {
   addListener(
     eventName: 'interruptionEnded',
     listenerFunc: (event: InterruptionEndedEvent) => void,
+  ): Promise<PluginListenerHandle> & PluginListenerHandle;
+
+  /**
+   * iOS and Android. Listen for live-streaming lifecycle events (WebSocket connect / disconnect /
+   * reconnect / dropped frames / error / finished). Use these for logging streaming health.
+   * These events never affect recording.
+   */
+  addListener(
+    eventName: 'recordingStreamEvent',
+    listenerFunc: (event: RecordingStreamEvent) => void,
   ): Promise<PluginListenerHandle> & PluginListenerHandle;
 
   /**

@@ -43,9 +43,14 @@ public class RecordData {
     }
 
     private long fileSize;
+    private JSObject streamingDiagnostics;
 
     public void setFileSize(long fileSize) {
         this.fileSize = fileSize;
+    }
+
+    public void setStreamingDiagnostics(JSObject streamingDiagnostics) {
+        this.streamingDiagnostics = streamingDiagnostics;
     }
 
     public JSObject toJSObject() {
@@ -59,6 +64,9 @@ public class RecordData {
         JSObject diagnostics = new JSObject();
         diagnostics.put("recorderType", "MediaRecorder");
         diagnostics.put("fileSize", fileSize);
+        if (streamingDiagnostics != null) {
+            diagnostics.put("streaming", streamingDiagnostics);
+        }
         toReturn.put("diagnostics", diagnostics);
 
         return toReturn;

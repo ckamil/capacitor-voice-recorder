@@ -12,6 +12,7 @@ import type {
   MicrophoneAvailabilityEvent,
   RecordingInterruptionEvent,
   InterruptionEndedEvent,
+  RecordingStreamEvent,
 } from './definitions';
 
 export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
@@ -83,7 +84,12 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
   ): Promise<PluginListenerHandle> & PluginListenerHandle;
 
   addListener(
-    _eventName: 'microphoneAvailabilityChanged' | 'recordingInterrupted' | 'interruptionEnded',
+    eventName: 'recordingStreamEvent',
+    listenerFunc: (event: RecordingStreamEvent) => void,
+  ): Promise<PluginListenerHandle> & PluginListenerHandle;
+
+  addListener(
+    _eventName: 'microphoneAvailabilityChanged' | 'recordingInterrupted' | 'interruptionEnded' | 'recordingStreamEvent',
     _listenerFunc: (event: any) => void,
   ): Promise<PluginListenerHandle> & PluginListenerHandle {
     // Create a dummy listener handle for web
