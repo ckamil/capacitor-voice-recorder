@@ -227,6 +227,9 @@ public class AudioStreamSink {
         frameHeader.put("endian", "big");
         start.put("frameHeader", frameHeader);
         start.put("startedAt", java.time.Instant.now().toString());
+        // Android always streams by tailing the on-disk ADTS file; the iOS-only encodeMode option
+        // does not apply, so report the effective mode for parity in the server-side meta.
+        start.put("encodeMode", "file_tail");
         if (config.config != null) {
             start.put("config", config.config);
         }

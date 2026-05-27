@@ -222,7 +222,8 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
             "channels": channels,
             "framesPerPacket": 1024,
             "frameHeader": ["seqBytes": 4, "timestampMsBytes": 4, "endian": "big"],
-            "startedAt": AudioStreamSink.iso8601(Date())
+            "startedAt": AudioStreamSink.iso8601(Date()),
+            "encodeMode": config.encodeMode.rawValue
         ]
         if !config.config.isEmpty { start["config"] = config.config }
 
