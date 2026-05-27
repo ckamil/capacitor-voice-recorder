@@ -2,6 +2,13 @@ import Foundation
 import AVFoundation
 import AudioToolbox
 
+/// PCM → AAC-LC ADTS frame encoder used by the live stream. Implemented by the hardware-codec
+/// path (`AacAdtsStreamEncoder`, AVAudioConverter) and the forced-software path
+/// (`AacAdtsSoftwareEncoder`, AudioConverterNewSpecific).
+protocol AacFrameEncoder: AnyObject {
+    func encode(_ pcmBuffer: AVAudioPCMBuffer) -> [Data]
+}
+
 /// Encodes PCM buffers (the same tap format used to write the file) into AAC-LC and returns
 /// self-contained ADTS frames (7-byte ADTS header + AAC payload) as `Data`.
 ///
@@ -9,7 +16,7 @@ import AudioToolbox
 /// `ExtAudioFile` and is the source of truth. `ExtAudioFileWrite` does not hand back the encoded
 /// bytes, so the live stream re-encodes here. A failure in this encoder only affects the optional
 /// stream — never the recording.
-final class AacAdtsStreamEncoder {
+final class AacAdtsStreamEncoder: AacFrameEncoder {
 
     private let converter: AVAudioConverter
     private let outputFormat: AVAudioFormat

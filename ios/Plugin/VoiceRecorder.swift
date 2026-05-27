@@ -480,6 +480,7 @@ public class VoiceRecorder: CAPPlugin {
         let maxBufferSeconds = (obj["maxBufferSeconds"] as? NSNumber)?.doubleValue ?? 10
         let pingIntervalMs = (obj["pingIntervalMs"] as? NSNumber)?.intValue ?? 20000
         let requireReachability = (obj["requireReachability"] as? Bool) ?? true
+        let encodeMode = StreamEncodeMode.from(obj["encodeMode"] as? String)
 
         return StreamingConfig(
             url: url,
@@ -491,7 +492,8 @@ public class VoiceRecorder: CAPPlugin {
             reconnectMaxAttempts: maxAttempts,
             maxBufferSeconds: maxBufferSeconds,
             pingIntervalMs: pingIntervalMs,
-            requireReachability: requireReachability
+            requireReachability: requireReachability,
+            encodeMode: encodeMode
         )
     }
 

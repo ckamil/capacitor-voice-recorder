@@ -60,6 +60,19 @@ export interface StreamingOptions {
   pingIntervalMs?: number;
   /** When true (default), only attempt/await connections while the OS reports network reachability. */
   requireReachability?: boolean;
+  /**
+   * iOS only. How the streamed AAC frames are produced. Android always tails the on-disk ADTS
+   * file and ignores this. Default 'file_tail'.
+   * - 'hardware'  — re-encode the mic PCM with AVAudioConverter (default codec, may pick the
+   *                 hardware AAC encoder). NOTE: the hardware encoder yields SILENCE on some
+   *                 devices (e.g. iPhone) while the session uses `.mixWithOthers`.
+   * - 'software'  — re-encode the mic PCM forcing the software AAC codec
+   *                 (AudioConverterNewSpecific + kAppleSoftwareAudioCodecManufacturer); not
+   *                 affected by `.mixWithOthers`.
+   * - 'file_tail' — do not re-encode; read the ADTS frames the recorder already writes to disk
+   *                 (same approach as Android). Works on all devices, no double encode.
+   */
+  encodeMode?: 'hardware' | 'software' | 'file_tail';
 }
 
 export type RecordingOptions =

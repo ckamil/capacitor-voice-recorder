@@ -20,8 +20,9 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     // their own queue so a slow/failing network cannot delay the file writes on writeQueue.
     // Set by VoiceRecorder before startRecording so streaming lifecycle events reach the JS layer.
     var onStreamEvent: (([String: Any]) -> Void)?
-    private var streamEncoder: AacAdtsStreamEncoder?
+    private var streamEncoder: AacFrameEncoder?
     private var streamSink: AudioStreamSink?
+    private var streamTailReader: AdtsFileTailReader?   // used only in .fileTail mode
     private let streamQueue = DispatchQueue(label: "com.capacitor.voicerecorder.streamencode")
     private var streamSeq: UInt32 = 0               // mutated only on streamQueue
     private var streamFramesEnqueued: UInt64 = 0    // mutated only on streamQueue (AAC frames sent to sink)
@@ -112,6 +113,7 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         streamFramesEnqueued = 0
         streamEncoder = nil
         streamSink = nil
+        streamTailReader = nil
         lastStreamingDiagnostics = nil
 
         do {
@@ -503,11 +505,20 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         // finalize the sink off-queue. Tap is already removed, so this also drains any last encode.
         var totalStreamFrames: UInt64 = 0
         var sinkToFinish: AudioStreamSink?
+        var readerToStop: AdtsFileTailReader?
         streamQueue.sync {
             totalStreamFrames = self.streamFramesEnqueued
             sinkToFinish = self.streamSink
+            readerToStop = self.streamTailReader
             self.streamSink = nil
             self.streamEncoder = nil
+            self.streamTailReader = nil
+        }
+        // .fileTail: stop the reader (final synchronous drain) and take its frame count — the
+        // tap-side counter (streamFramesEnqueued) is 0 in that mode.
+        if let reader = readerToStop {
+            reader.stop()
+            totalStreamFrames = reader.framesEnqueued
         }
         if let sink = sinkToFinish {
             let rate = inputSampleRate > 0 ? inputSampleRate : 48000
@@ -649,18 +660,30 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     private func setupStreamingIfNeeded(pcmFormat: AVAudioFormat) {
         guard let cfg = options.streaming else { return }
 
-        guard let encoder = AacAdtsStreamEncoder(pcmFormat: pcmFormat) else {
-            lastStreamingDiagnostics = ["enabled": true, "finalState": "encoder_init_failed"]
+        // Build the AAC frame producer for the chosen mode. `.fileTail` does not re-encode — it
+        // tails the on-disk ADTS file — so no tap-side encoder is created in that case.
+        var encoder: AacFrameEncoder?
+        switch cfg.encodeMode {
+        case .hardware:
+            encoder = AacAdtsStreamEncoder(pcmFormat: pcmFormat)
+        case .software:
+            encoder = AacAdtsSoftwareEncoder(pcmFormat: pcmFormat)
+        case .fileTail:
+            encoder = nil
+        }
+
+        if cfg.encodeMode != .fileTail && encoder == nil {
+            lastStreamingDiagnostics = ["enabled": true, "finalState": "encoder_init_failed", "encodeMode": cfg.encodeMode.rawValue]
             onStreamEvent?(streamEvent([
                 "type": "error",
                 "reason": "encoder_init_failed",
-                "message": "Unable to initialise AAC encoder for streaming"
+                "message": "Unable to initialise AAC encoder for streaming (mode \(cfg.encodeMode.rawValue))"
             ]))
-            NSLog("AudioEngineRecorder: streaming disabled — AAC encoder init failed")
+            NSLog("AudioEngineRecorder: streaming disabled — AAC encoder init failed (mode %@)", cfg.encodeMode.rawValue)
             return
         }
 
-        lastStreamingDiagnostics = ["enabled": true, "finalState": "init"]
+        lastStreamingDiagnostics = ["enabled": true, "finalState": "init", "encodeMode": cfg.encodeMode.rawValue]
         let sink = AudioStreamSink(
             config: cfg,
             sampleRate: pcmFormat.sampleRate,
@@ -669,13 +692,26 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         ) { [weak self] event in
             self?.onStreamEvent?(event)
         }
-        // Assign on streamQueue so these references are only ever touched there (the tap reads
-        // them on streamQueue, stop nils them there) — no cross-thread access to the references.
+        sink.start()
+
+        if cfg.encodeMode == .fileTail {
+            // No tap encoder; tail the ADTS file the recorder is already writing.
+            let reader = AdtsFileTailReader(fileURL: aacFileURL, sink: sink, sampleRate: pcmFormat.sampleRate)
+            streamQueue.async {
+                self.streamEncoder = nil
+                self.streamSink = sink
+                self.streamTailReader = reader
+            }
+            reader.start()
+            return
+        }
+
+        // hardware / software: encode the tap's PCM. Assign on streamQueue so these references
+        // are only ever touched there (the tap reads them on streamQueue, stop nils them there).
         streamQueue.async {
             self.streamEncoder = encoder
             self.streamSink = sink
         }
-        sink.start()
     }
 
     private func streamEvent(_ payload: [String: Any]) -> [String: Any] {
@@ -689,6 +725,8 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     private func cleanupAfterFailedStart() {
         NSLog("AudioEngineRecorder: cleanupAfterFailedStart")
         removeEngineConfigObserver()
+        streamTailReader?.stop()
+        streamTailReader = nil
         if let sink = streamSink {
             sink.cancel()
             streamSink = nil
