@@ -105,12 +105,35 @@ Dla każdego: **iPhone17,1 i iPad14,5**, 30 s; sprawdź śr. rozmiar ramki + `me
 | H2 | Katalog `<person>_<uuid>` — uuid zgodny z `recordings.uuid` (po sync) |
 | H3 | `dropped`/`gap` poprawnie w evencie i logu serwera |
 
+## I. Diagnostyka `audioConfig` + `route` (odpowiedź `stopRecording`)
+Pola dodawane best-effort do `result.diagnostics` zwracanego przez `stopRecording` (nie do `meta.json`/streamu).
+Obserwacja: log/Rollbar payloadu `stopRecording` albo `console` w WebView. **Zasada nadrzędna:** brak/niepoprawny
+odczyt MUSI tylko pominąć klucz — nigdy nie wywala stopu ani nie psuje nagrania kanonicznego.
+
+**Słownik znormalizowany `route` (wspólny iOS↔Android):** `builtin_mic` / `bluetooth` / `wired_headset` /
+`usb` / `speaker` (iOS dla nieznanego portu → surowy `portType`; Android → `other`).
+
+| # | Scenariusz | Jak wykonać | Oczekiwane |
+|---|---|---|---|
+| I1 | Android `audioConfig` | nagraj 10 s na Androidzie | `audioConfig={sample_rate:44100, channels:1, bitrate:96000, format:"aac"}` — zgodne z konfiguracją `CustomMediaRecorder` (jawny CBR) |
+| I2 | iOS legacy `audioConfig` | iOS bez streamingu (recorder legacy), 10 s | `sample_rate:44100, channels:1, format:"aac"`; **`bitrate` nieobecny** (VBR `AVEncoderAudioQualityKey`) |
+| I3 | iOS engine `audioConfig` | iOS streaming `software`/`hardware` (recorder silnikowy), 10 s | `sample_rate`/`channels` = realny `input_*` z `diagnostics.engine` (zwykle 48000) — **nie** sztywne 44100; `format:"aac"` |
+| I4 | Spójność z plikiem | porównaj `audioConfig.sample_rate` z `ffprobe audio.aac` | wartości się zgadzają na obu platformach (i1–i3) |
+| I5 | `route` mikrofon wbudowany | nagraj bez akcesoriów | `route="builtin_mic"` na obu platformach |
+| I6 | `route` Bluetooth | sparuj słuchawki BT (HFP/SCO), nagraj | `route="bluetooth"` na obu |
+| I7 | `route` przewodowe | podłącz zestaw/słuchawki z mikrofonem przez jack/USB-C-jack | `route="wired_headset"` na obu |
+| I8 | `route` USB | mikrofon/interfejs USB-C | `route="usb"` na obu |
+| I9 | Android: odczyt przed `release()` | nagraj z akcesorium, sprawdź że route ustawione | `getRoutedDevice()` przechwycone przed `stop()/release()`; po release zwróciłoby `null` → klucz byłby pominięty (regresja jeśli brak) |
+| I10 | Best-effort / brak danych | wymuś brak route (np. brak aktywnego inputu w `currentRoute`) | klucz `route` pominięty; **brak crasha**; nagranie kanoniczne i `msDuration` poprawne |
+| I11 | Zmiana toru w trakcie | rozpocznij na BT, odepnij w trakcie, stop na wbudowanym | `route` odzwierciedla stan z chwili stopu (iOS) / tuż przed release (Android); brak crasha, plik pełny |
+
 ---
 
 ## Kolejność prowadzenia
 1. **F (encodeMode)** — rdzeń, oba urządzenia; ustal docelowy tryb (`file_tail`).
 2. **A → B → C** (sieć) — większość „dziwnych przypadków".
 3. **E** (lifecycle) — najbliżej realnego użycia w terenie.
+3a. **I** (`audioConfig`/`route`) — niezależne od sieci; wygodnie wykonać przy **A**/**F** (te same nagrania) oraz przy podpinaniu akcesoriów (BT/przewodowe/USB).
 4. Dla każdego testu zapisz: app event log, serwerowy `end`/`gap`/`onError`, rozmiar+`ffprobe`+parser
    pliku backupu, oraz **potwierdzenie kompletności nagrania kanonicznego**.
 

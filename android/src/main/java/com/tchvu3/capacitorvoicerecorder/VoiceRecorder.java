@@ -156,6 +156,27 @@ public class VoiceRecorder extends Plugin {
             );
             recordData.setFileSize(recordedFile.length());
             recordData.setStreamingDiagnostics(streamingDiagnostics);
+
+            // Best-effort audio config + actual input (mic) route. Each block is isolated in
+            // try/catch: if anything is unreadable the field is simply omitted — never crashes
+            // the stop. Values mirror the encoder config set in CustomMediaRecorder.
+            try {
+                JSObject audioConfig = new JSObject();
+                audioConfig.put("sample_rate", 44100);
+                audioConfig.put("channels", 1);
+                audioConfig.put("bitrate", 96000);
+                audioConfig.put("format", "aac");
+                recordData.setAudioConfig(audioConfig);
+            } catch (Exception ignored) {}
+            try {
+                // Actual input (mic) route captured by the recorder before release — normalized
+                // to the vocabulary shared with iOS (builtin_mic/bluetooth/wired_headset/usb/other).
+                String route = mediaRecorder.getInputRoute();
+                if (route != null) {
+                    recordData.setRoute(route);
+                }
+            } catch (Exception ignored) {}
+
             if ((recordDataBase64 == null && path == null) || recordData.getMsDuration() < 0) {
                 call.reject(Messages.EMPTY_RECORDING);
             } else {

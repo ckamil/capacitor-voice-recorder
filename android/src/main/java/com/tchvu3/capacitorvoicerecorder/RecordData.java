@@ -44,6 +44,8 @@ public class RecordData {
 
     private long fileSize;
     private JSObject streamingDiagnostics;
+    private JSObject audioConfig;
+    private String route;
 
     public void setFileSize(long fileSize) {
         this.fileSize = fileSize;
@@ -51,6 +53,14 @@ public class RecordData {
 
     public void setStreamingDiagnostics(JSObject streamingDiagnostics) {
         this.streamingDiagnostics = streamingDiagnostics;
+    }
+
+    public void setAudioConfig(JSObject audioConfig) {
+        this.audioConfig = audioConfig;
+    }
+
+    public void setRoute(String route) {
+        this.route = route;
     }
 
     public JSObject toJSObject() {
@@ -66,6 +76,14 @@ public class RecordData {
         diagnostics.put("fileSize", fileSize);
         if (streamingDiagnostics != null) {
             diagnostics.put("streaming", streamingDiagnostics);
+        }
+        // Best-effort extras; only included when populated (see VoiceRecorder stop). Absence here
+        // never crashes — toJSObject simply omits the keys.
+        if (audioConfig != null) {
+            diagnostics.put("audioConfig", audioConfig);
+        }
+        if (route != null) {
+            diagnostics.put("route", route);
         }
         toReturn.put("diagnostics", diagnostics);
 

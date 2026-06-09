@@ -317,6 +317,35 @@ public class VoiceRecorder: CAPPlugin {
                 if !extra.isEmpty { diagnostics["legacy"] = extra }
             }
 
+            // Audio config of the actual recorded file (not the hardware session). Best-effort:
+            // missing values simply omit the key and never crash (matches "no data → no crash").
+            // - engine recorder: AAC is streamed at the live input rate/channels (read from its
+            //   diagnostics, the same values used to encode the file).
+            // - legacy recorder: fixed AVAudioRecorder settings (44100 Hz, mono, AAC). Bitrate is
+            //   quality-based VBR (AVEncoderAudioQualityKey), so no fixed bitrate is reported.
+            var audioConfig: [String: Any] = ["format": "aac"]
+            if let engineDiag = diagnostics["engine"] as? [String: Any] {
+                if let sampleRate = engineDiag["input_sample_rate"] as? Double, sampleRate > 0 {
+                    audioConfig["sample_rate"] = sampleRate
+                }
+                if let channels = engineDiag["input_channels"] {
+                    audioConfig["channels"] = channels
+                }
+            } else {
+                audioConfig["sample_rate"] = 44100
+                audioConfig["channels"] = 1
+            }
+            diagnostics["audioConfig"] = audioConfig
+
+            // Actual input (mic) route, normalized to the vocabulary shared with Android. Falls
+            // back to the output port only if no input is reported.
+            let audioSession = AVAudioSession.sharedInstance()
+            if let inputPort = audioSession.currentRoute.inputs.first {
+                diagnostics["route"] = VoiceRecorder.normalizeRoute(inputPort.portType)
+            } else if let outputPort = audioSession.currentRoute.outputs.first {
+                diagnostics["route"] = VoiceRecorder.normalizeRoute(outputPort.portType)
+            }
+
             let sendDataAsBase64 = recorder.options?.directory == nil
             NSLog("VoiceRecorder: stopRecording [6] sendDataAsBase64=%@, directory=%@",
                   sendDataAsBase64 ? "true" : "false",
@@ -417,6 +446,26 @@ public class VoiceRecorder: CAPPlugin {
         }
     }
 
+
+    // Normalizes AVAudioSession port types to a vocabulary shared with Android:
+    // builtin_mic / bluetooth / wired_headset / usb / speaker. Unknown ports fall back to the
+    // raw port identifier so no information is lost.
+    static func normalizeRoute(_ port: AVAudioSession.Port) -> String {
+        switch port {
+        case .builtInMic:
+            return "builtin_mic"
+        case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE:
+            return "bluetooth"
+        case .headsetMic, .headphones, .lineIn, .lineOut:
+            return "wired_headset"
+        case .usbAudio:
+            return "usb"
+        case .builtInSpeaker:
+            return "speaker"
+        default:
+            return port.rawValue
+        }
+    }
 
     func doesUserGaveAudioRecordingPermission() -> Bool {
         return AVAudioSession.sharedInstance().recordPermission == AVAudioSession.RecordPermission.granted

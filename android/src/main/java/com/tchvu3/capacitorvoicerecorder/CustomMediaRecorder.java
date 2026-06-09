@@ -24,6 +24,7 @@ public class CustomMediaRecorder {
     private AdtsStreamReader streamReader;
     private AudioStreamSink.EventListener streamEventListener;
     private JSObject streamingDiagnostics;
+    private String inputRoute;
 
     public CustomMediaRecorder(Context context, RecordOptions options) throws IOException {
         android.util.Log.d("CustomMediaRecorder", "Constructor called");
@@ -130,12 +131,47 @@ public class CustomMediaRecorder {
     }
 
     public void stopRecording() {
+        // Capture the active input (mic) route BEFORE stop()/release() — getRoutedDevice()
+        // returns null once the recorder is released. Best-effort: any failure leaves the
+        // route unset rather than crashing the stop.
+        try {
+            if (mediaRecorder != null && Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                android.media.AudioDeviceInfo device = mediaRecorder.getRoutedDevice();
+                if (device != null) {
+                    inputRoute = mapInputRoute(device.getType());
+                }
+            }
+        } catch (Exception ignored) {}
         try {
             mediaRecorder.stop();
             mediaRecorder.release();
         } finally {
             currentRecordingStatus = CurrentRecordingStatus.NONE;
             stopStreaming();
+        }
+    }
+
+    public String getInputRoute() {
+        return inputRoute;
+    }
+
+    // Normalizes Android AudioDeviceInfo input types to a vocabulary shared with iOS:
+    // builtin_mic / bluetooth / wired_headset / usb / other.
+    private static String mapInputRoute(int deviceType) {
+        switch (deviceType) {
+            case android.media.AudioDeviceInfo.TYPE_BUILTIN_MIC:
+                return "builtin_mic";
+            case android.media.AudioDeviceInfo.TYPE_BLUETOOTH_SCO:
+            case android.media.AudioDeviceInfo.TYPE_BLE_HEADSET:
+                return "bluetooth";
+            case android.media.AudioDeviceInfo.TYPE_WIRED_HEADSET:
+                return "wired_headset";
+            case android.media.AudioDeviceInfo.TYPE_USB_DEVICE:
+            case android.media.AudioDeviceInfo.TYPE_USB_HEADSET:
+            case android.media.AudioDeviceInfo.TYPE_USB_ACCESSORY:
+                return "usb";
+            default:
+                return "other";
         }
     }
 
