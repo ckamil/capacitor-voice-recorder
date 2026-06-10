@@ -432,6 +432,21 @@ public class VoiceRecorder extends Plugin {
 
     @Override
     public void handleOnDestroy() {
+        // Release any active recording when the Activity/Bridge is destroyed. The OS process can
+        // outlive the Activity (Android keeps it warm; a "close + reopen" recreates the Activity ->
+        // handleOnDestroy() then load() on the SAME process). Without this, the old plugin instance's
+        // MediaRecorder keeps capturing and holding the microphone, while the freshly loaded instance
+        // has mediaRecorder=null and can never reach it again (getCurrentStatus()=NONE, stopRecording()
+        // rejects on null) -> orphaned native recorder, the OS mic indicator stays on forever. There
+        // is no JS owner for a recording whose Bridge was destroyed, so stopping it here is correct.
+        if (mediaRecorder != null) {
+            try {
+                mediaRecorder.stopRecording();
+            } catch (Exception ignored) {
+                // stopRecording() already guarantees release() in its finally; swallow any stop error.
+            }
+            mediaRecorder = null;
+        }
         releaseGlobalAudioFocusListener();
         super.handleOnDestroy();
     }

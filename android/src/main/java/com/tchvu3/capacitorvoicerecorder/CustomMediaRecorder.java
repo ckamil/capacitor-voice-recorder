@@ -144,8 +144,18 @@ public class CustomMediaRecorder {
         } catch (Exception ignored) {}
         try {
             mediaRecorder.stop();
-            mediaRecorder.release();
+        } catch (Exception e) {
+            // MediaRecorder.stop() throws IllegalStateException for very short or paused/just-resumed
+            // recordings (common in the promoter flow: rapid start/stop on form switches, and stop
+            // after a focus-loss pause). Swallow it — release() below MUST still run. If it didn't,
+            // the native AudioRecord would keep holding the microphone (orphaned recorder, the OS mic
+            // indicator stays on), while currentRecordingStatus=NONE makes getCurrentStatus() report
+            // NONE so neither JS nor native stopRecording() could ever reach and free it.
+            android.util.Log.w("CustomMediaRecorder", "stop() failed, releasing anyway: " + e.getMessage());
         } finally {
+            try {
+                mediaRecorder.release();
+            } catch (Exception ignored) {}
             currentRecordingStatus = CurrentRecordingStatus.NONE;
             stopStreaming();
         }
