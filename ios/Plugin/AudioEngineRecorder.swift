@@ -238,10 +238,21 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             // client (PCM) data format we feed into the AAC encoder below. Kept fixed for the
             // whole recording so it survives a route/sample-rate change (the engine resamples
             // into this format when the tap is re-installed after a configuration change).
-            let recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
-                                                sampleRate: inputFormat.sampleRate,
-                                                channels: 1,
-                                                interleaved: false)!
+            guard let recordingFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32,
+                                                      sampleRate: inputFormat.sampleRate,
+                                                      channels: 1,
+                                                      interleaved: false) else {
+                cleanupAfterFailedStart()
+                return RecordingResult.failure(
+                    stage: "engine_start",
+                    details: [
+                        "recorderType": "engine",
+                        "sampleRate": inputFormat.sampleRate,
+                        "channelCount": inputFormat.channelCount
+                    ],
+                    errorDescription: "Failed to create PCM recording format (sampleRate=\(inputFormat.sampleRate))"
+                )
+            }
             self.recordingFormat = recordingFormat
 
             // Open the AAC (ADTS) output file and encode the tap's PCM directly to AAC,
