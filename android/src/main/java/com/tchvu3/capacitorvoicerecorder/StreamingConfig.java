@@ -21,6 +21,14 @@ public class StreamingConfig {
     public final double maxBufferSeconds;
     public final int pingIntervalMs; // 0 = disabled
     public final boolean requireReachability;
+    // Auto-suspend (opt-in; mirrors iOS). When disabled the sink behaves exactly as before.
+    public final boolean autosuspendEnabled;
+    public final int suspendAfterReconnects;
+    public final double suspendDropRateFps;
+    public final double suspendDropWindowSec;
+    public final double suspendCooldownSec;
+    public final double suspendMaxCooldownSec;
+    public final double suspendMaxTotalSec;
 
     public StreamingConfig(
         String url,
@@ -32,7 +40,14 @@ public class StreamingConfig {
         int reconnectMaxAttempts,
         double maxBufferSeconds,
         int pingIntervalMs,
-        boolean requireReachability
+        boolean requireReachability,
+        boolean autosuspendEnabled,
+        int suspendAfterReconnects,
+        double suspendDropRateFps,
+        double suspendDropWindowSec,
+        double suspendCooldownSec,
+        double suspendMaxCooldownSec,
+        double suspendMaxTotalSec
     ) {
         this.url = url;
         this.token = token;
@@ -44,6 +59,13 @@ public class StreamingConfig {
         this.maxBufferSeconds = maxBufferSeconds;
         this.pingIntervalMs = pingIntervalMs;
         this.requireReachability = requireReachability;
+        this.autosuspendEnabled = autosuspendEnabled;
+        this.suspendAfterReconnects = suspendAfterReconnects;
+        this.suspendDropRateFps = suspendDropRateFps;
+        this.suspendDropWindowSec = suspendDropWindowSec;
+        this.suspendCooldownSec = suspendCooldownSec;
+        this.suspendMaxCooldownSec = suspendMaxCooldownSec;
+        this.suspendMaxTotalSec = suspendMaxTotalSec;
     }
 
     /** Returns null (streaming disabled) when the object is absent or the URL is missing/invalid. */
@@ -85,6 +107,15 @@ public class StreamingConfig {
         int pingIntervalMs = obj.optInt("pingIntervalMs", 20000);
         boolean requireReachability = obj.optBoolean("requireReachability", true);
 
+        JSObject autosuspend = obj.getJSObject("autosuspend");
+        boolean autosuspendEnabled = autosuspend != null && autosuspend.optBoolean("enabled", false);
+        int suspendAfterReconnects = autosuspend != null ? autosuspend.optInt("afterReconnects", 4) : 4;
+        double suspendDropRateFps = autosuspend != null ? autosuspend.optDouble("dropRateFps", 30) : 30;
+        double suspendDropWindowSec = autosuspend != null ? autosuspend.optDouble("dropWindowSec", 20) : 20;
+        double suspendCooldownSec = autosuspend != null ? autosuspend.optDouble("cooldownSec", 60) : 60;
+        double suspendMaxCooldownSec = autosuspend != null ? autosuspend.optDouble("maxCooldownSec", 600) : 600;
+        double suspendMaxTotalSec = autosuspend != null ? autosuspend.optDouble("maxTotalSec", 1800) : 1800;
+
         return new StreamingConfig(
             url,
             token,
@@ -95,7 +126,14 @@ public class StreamingConfig {
             maxAttempts,
             maxBufferSeconds,
             pingIntervalMs,
-            requireReachability
+            requireReachability,
+            autosuspendEnabled,
+            suspendAfterReconnects,
+            suspendDropRateFps,
+            suspendDropWindowSec,
+            suspendCooldownSec,
+            suspendMaxCooldownSec,
+            suspendMaxTotalSec
         );
     }
 }

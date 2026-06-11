@@ -26,6 +26,15 @@ struct StreamingConfig {
     let pingIntervalMs: Int            // 0 = disabled
     let requireReachability: Bool
     let encodeMode: StreamEncodeMode   // iOS encode strategy; default .fileTail
+    // Auto-suspend: stop churning the WS on a dead-but-reachable link. Opt-in; when disabled the
+    // sink behaves exactly as before. See AudioStreamSink suspend logic + JS SettingsService flags.
+    let autosuspendEnabled: Bool       // false = no new behaviour (byte-for-byte legacy path)
+    let suspendAfterReconnects: Int    // consecutive reconnect attempts before suspending
+    let suspendDropRateFps: Double     // sustained drop rate (while connected) that triggers suspend
+    let suspendDropWindowSec: Double   // window over which the drop rate is measured
+    let suspendCooldownSec: Double     // first cooldown before a probe; doubles each failed probe
+    let suspendMaxCooldownSec: Double  // cap on the (doubling) cooldown
+    let suspendMaxTotalSec: Double     // fail-open backstop: total suspended time before giving up
 }
 
 struct RecordOptions {

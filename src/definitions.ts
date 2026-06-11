@@ -43,6 +43,30 @@ export interface StreamingReconnectOptions {
   maxAttempts?: number;
 }
 
+/**
+ * Auto-suspend: when the link is dead-but-reachable (handshake storms, or frames dropping faster
+ * than they send), park the WebSocket on a doubling cooldown with periodic probes instead of
+ * churning the radio. Self-regulating natively (JS is suspended in the background, where this
+ * matters). Purely additive — never affects the on-disk recording. All optional; when `enabled`
+ * is false the sink behaves exactly as before.
+ */
+export interface StreamingAutosuspendOptions {
+  /** Master switch. Default false (legacy behaviour, byte-for-byte). */
+  enabled?: boolean;
+  /** Consecutive reconnect attempts before suspending. Default 4. */
+  afterReconnects?: number;
+  /** Sustained drop rate (frames/s, while connected) that triggers suspend. Default 30. */
+  dropRateFps?: number;
+  /** Window (s) over which the drop rate is measured. Default 20. */
+  dropWindowSec?: number;
+  /** First cooldown (s) before a probe reconnect; doubles each failed probe. Default 60. */
+  cooldownSec?: number;
+  /** Cap on the doubling cooldown (s). Default 600. */
+  maxCooldownSec?: number;
+  /** Fail-open backstop: total suspended time (s) before giving up streaming for this recording. Default 1800. */
+  maxTotalSec?: number;
+}
+
 export interface StreamingOptions {
   /** WebSocket URL of the transcription/audio server for the active profile. `wss://` required. */
   url: string;
@@ -73,6 +97,8 @@ export interface StreamingOptions {
    *                 (same approach as Android). Works on all devices, no double encode.
    */
   encodeMode?: 'hardware' | 'software' | 'file_tail';
+  /** Auto-suspend on a dead-but-reachable link. Omit / `enabled:false` → legacy behaviour. */
+  autosuspend?: StreamingAutosuspendOptions;
 }
 
 export type RecordingOptions =
@@ -110,6 +136,10 @@ export interface LifecycleSnapshot {
   last_active_at_ms: number;
   last_resign_active_at_ms: number;
   abnormal_restart_pending: boolean;
+  /** Filename of the recording finalized in willTerminate (user force-quit mid-recording); "" when none. */
+  terminated_recording_file?: string;
+  /** When the willTerminate finalize ran (epoch ms); 0 when none. */
+  terminated_recording_at_ms?: number;
   thermal_state?: 'nominal' | 'fair' | 'serious' | 'critical' | 'unknown';
   low_power_mode?: boolean;
   is_protected_data_available?: boolean;
@@ -146,6 +176,9 @@ export type RecordingStreamEventType =
   | 'disconnected'
   | 'error'
   | 'dropped'
+  // auto-suspend: streaming parked on a dead link (`suspended`) / link recovered (`resumed`)
+  | 'suspended'
+  | 'resumed'
   | 'finished';
 
 /**
@@ -169,8 +202,10 @@ export interface RecordingStreamEvent {
   reason?: string;
   /** `error`: human-readable description. */
   message?: string;
-  /** `dropped`: cumulative frames discarded due to buffer overflow. */
+  /** `dropped` / `suspended` / `resumed`: cumulative frames discarded due to buffer overflow. */
   droppedFrames?: number;
+  /** `suspended`: cooldown (ms) before the next probe reconnect. */
+  cooldownMs?: number;
   /** `finished`: total frames sent over the session. */
   framesSent?: number;
   /** `finished`: total bytes sent over the session. */

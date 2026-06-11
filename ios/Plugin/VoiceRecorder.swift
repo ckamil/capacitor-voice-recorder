@@ -425,6 +425,10 @@ public class VoiceRecorder: CAPPlugin {
             "last_active_at_ms": NSNumber(value: lastActive),
             "last_resign_active_at_ms": NSNumber(value: lastResign),
             "abnormal_restart_pending": abnormal,
+            // Set by handleAppWillTerminate when the user force-quit mid-recording; lets the JS
+            // layer label the orphaned recording user_app_close instead of system_app_restart.
+            "terminated_recording_file": defaults.string(forKey: "vr_terminated_recording_file") ?? "",
+            "terminated_recording_at_ms": NSNumber(value: Int64(defaults.integer(forKey: "vr_terminated_recording_at_ms"))),
             "thermal_state": self.thermalStateString(),
             "low_power_mode": ProcessInfo.processInfo.isLowPowerModeEnabled,
             "is_protected_data_available": UIApplication.shared.isProtectedDataAvailable
@@ -432,7 +436,10 @@ public class VoiceRecorder: CAPPlugin {
     }
 
     @objc func clearAbnormalRestartFlag(_ call: CAPPluginCall) {
-        UserDefaults.standard.set(false, forKey: "vr_abnormal_restart_pending")
+        let defaults = UserDefaults.standard
+        defaults.set(false, forKey: "vr_abnormal_restart_pending")
+        defaults.removeObject(forKey: "vr_terminated_recording_file")
+        defaults.removeObject(forKey: "vr_terminated_recording_at_ms")
         call.resolve()
     }
 
@@ -531,6 +538,16 @@ public class VoiceRecorder: CAPPlugin {
         let requireReachability = (obj["requireReachability"] as? Bool) ?? true
         let encodeMode = StreamEncodeMode.from(obj["encodeMode"] as? String)
 
+        // Auto-suspend block (optional). Absent / enabled=false → legacy behaviour unchanged.
+        let autosuspend = obj["autosuspend"] as? JSObject
+        let autosuspendEnabled = (autosuspend?["enabled"] as? Bool) ?? false
+        let suspendAfterReconnects = (autosuspend?["afterReconnects"] as? NSNumber)?.intValue ?? 4
+        let suspendDropRateFps = (autosuspend?["dropRateFps"] as? NSNumber)?.doubleValue ?? 30
+        let suspendDropWindowSec = (autosuspend?["dropWindowSec"] as? NSNumber)?.doubleValue ?? 20
+        let suspendCooldownSec = (autosuspend?["cooldownSec"] as? NSNumber)?.doubleValue ?? 60
+        let suspendMaxCooldownSec = (autosuspend?["maxCooldownSec"] as? NSNumber)?.doubleValue ?? 600
+        let suspendMaxTotalSec = (autosuspend?["maxTotalSec"] as? NSNumber)?.doubleValue ?? 1800
+
         return StreamingConfig(
             url: url,
             token: token,
@@ -542,7 +559,14 @@ public class VoiceRecorder: CAPPlugin {
             maxBufferSeconds: maxBufferSeconds,
             pingIntervalMs: pingIntervalMs,
             requireReachability: requireReachability,
-            encodeMode: encodeMode
+            encodeMode: encodeMode,
+            autosuspendEnabled: autosuspendEnabled,
+            suspendAfterReconnects: suspendAfterReconnects,
+            suspendDropRateFps: suspendDropRateFps,
+            suspendDropWindowSec: suspendDropWindowSec,
+            suspendCooldownSec: suspendCooldownSec,
+            suspendMaxCooldownSec: suspendMaxCooldownSec,
+            suspendMaxTotalSec: suspendMaxTotalSec
         )
     }
 
@@ -889,6 +913,43 @@ public class VoiceRecorder: CAPPlugin {
         }
 
         setupGlobalAudioSessionListener()
+
+        // Emergency finalize on user force-quit. iOS calls willTerminate (with a ~few-second
+        // budget) when the user swipes a RUNNING app away — which, with the audio background
+        // mode, is exactly the state during an active recording. Stopping the recorder here
+        // flushes the trailing AAC packet so the on-disk file ends cleanly; the JS layer never
+        // comes back, so the boot-time orphan recovery attaches the file on next launch.
+        // Jetsam kills never fire this — the ADTS file is still rescued by the same boot
+        // recovery, just without the final flush (ADTS is playable up to the last frame).
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppWillTerminate),
+            name: UIApplication.willTerminateNotification,
+            object: nil
+        )
+    }
+
+    @objc private func handleAppWillTerminate() {
+        guard let recorder = customMediaRecorder else {
+            return
+        }
+        NSLog("VoiceRecorder: willTerminate with active recording — emergency finalize")
+        // Synchronous on purpose: after willTerminate returns the process is killed, so there
+        // is no later opportunity. recorder.stopRecording() drains the write queue and runs
+        // ExtAudioFileDispose, which flushes the trailing packet.
+        recorder.stopRecording()
+        if let url = recorder.getOutputFile() {
+            // Marker for the JS boot recovery/diagnostics: the kill happened mid-recording and
+            // the file below was already finalized.
+            let defaults = UserDefaults.standard
+            defaults.set(url.lastPathComponent, forKey: "vr_terminated_recording_file")
+            defaults.set(Int64(Date().timeIntervalSince1970 * 1000), forKey: "vr_terminated_recording_at_ms")
+            // The process is killed the moment willTerminate returns — force the (normally
+            // async) defaults flush so the marker survives.
+            defaults.synchronize()
+        }
+        customMediaRecorder = nil
+        endRecordingBackgroundTask()
     }
 
     deinit {

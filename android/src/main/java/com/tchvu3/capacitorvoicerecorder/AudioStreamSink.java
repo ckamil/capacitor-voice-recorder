@@ -66,6 +66,17 @@ public class AudioStreamSink {
     private long lastDropEventAt = 0;
     private ScheduledFuture<?> reconnectFuture;
 
+    // Auto-suspend runtime state (all on exec). No-ops when !config.autosuspendEnabled.
+    private boolean suspended = false;
+    private boolean probing = false;
+    private boolean probeScheduled = false;
+    private double currentCooldownSec = 0;     // grows ×2 per failed probe, capped
+    private double totalSuspendedSec = 0;       // accumulates toward suspendMaxTotalSec
+    private volatile int suspends = 0;          // volatile: read off-thread in diagnosticsSnapshot()
+    private long dropWindowStartMs = 0;         // 0 = no window open
+    private long dropWindowStartCount = 0;
+    private ScheduledFuture<?> probeFuture;
+
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
 
@@ -130,10 +141,18 @@ public class AudioStreamSink {
         final byte[] payload = frame(seq, timestampMs, adtsFrame);
         post(() -> {
             if (closed || finishing || fatal) return;
+            // Suspended: count the loss but don't buffer or send (bounded, no growth). The on-disk
+            // file is unaffected; we resume on probe / network return.
+            if (suspended) {
+                framesDropped++;
+                noteDropThrottled();
+                return;
+            }
             if (pending.size() >= maxBufferedFrames) {
                 pending.pollFirst();
                 framesDropped++;
                 noteDropThrottled();
+                evaluateDropTrigger();
             }
             pending.offerLast(payload);
             pump();
@@ -166,6 +185,7 @@ public class AudioStreamSink {
         d.put("framesDropped", framesDropped);
         d.put("bytesSent", bytesSent);
         d.put("reconnects", reconnects);
+        d.put("suspends", suspends);
         if (lastError != null) {
             d.put("lastError", lastError);
         }
@@ -202,6 +222,18 @@ public class AudioStreamSink {
         }
         reconnectAttempt = 0;
         finalState = "connected";
+        // A probe (or network-restored wake) that lands here means the link is back: reset the
+        // backoff/cooldown and tell the JS layer streaming resumed.
+        if (probing) {
+            probing = false;
+            currentCooldownSec = 0;
+            JSObject r = new JSObject();
+            r.put("type", "resumed");
+            r.put("droppedFrames", framesDropped);
+            r.put("reconnects", reconnects);
+            emitRaw(r);
+        }
+        dropWindowStartMs = 0; // fresh drop-rate window for the (re)connected session
         emit("connected", null);
         // Only declare `start` once the real ADTS format is known (parsed from the first frame),
         // so the server never gets a wrong-then-duplicate format. setFormat() sends it otherwise.
@@ -315,6 +347,21 @@ public class AudioStreamSink {
     private void scheduleReconnect() {
         if (closed || finishing || fatal) return;
 
+        // A failed PROBE while suspended: re-suspend (cooldown already doubling) instead of the
+        // normal backoff cycle.
+        if (probing) {
+            probing = false;
+            enterSuspend("probe_failed");
+            return;
+        }
+
+        // Reconnect storm: after N consecutive attempts the link is effectively dead — stop churning
+        // handshakes and drop into the suspend/cooldown cycle. Opt-in.
+        if (config.autosuspendEnabled && !suspended && reconnectAttempt >= Math.max(1, config.suspendAfterReconnects)) {
+            enterSuspend("reconnect_storm");
+            return;
+        }
+
         if (config.reconnectMaxAttempts > 0 && reconnectAttempt >= config.reconnectMaxAttempts) {
             fatal = true;
             finalState = "fatal";
@@ -343,6 +390,104 @@ public class AudioStreamSink {
         }, (long) backoff);
     }
 
+    // ----- Auto-suspend (all on exec) -----
+
+    private void enterSuspend(String reason) {
+        if (closed || finishing || fatal || suspended) return;
+        suspended = true;
+        probing = false;
+        suspends++;
+        finalState = "suspended";
+
+        connected = false;
+        startSent = false;
+        if (webSocket != null) {
+            webSocket.cancel();
+            webSocket = null;
+        }
+        if (reconnectFuture != null) { reconnectFuture.cancel(false); reconnectFuture = null; }
+        dropWindowStartMs = 0;
+
+        currentCooldownSec = currentCooldownSec <= 0
+            ? Math.max(1, config.suspendCooldownSec)
+            : Math.min(Math.max(config.suspendCooldownSec, config.suspendMaxCooldownSec), currentCooldownSec * 2);
+
+        JSObject e = new JSObject();
+        e.put("type", "suspended");
+        e.put("reason", reason);
+        e.put("droppedFrames", framesDropped);
+        e.put("reconnects", reconnects);
+        e.put("cooldownMs", (int) (currentCooldownSec * 1000));
+        emitRaw(e);
+        scheduleProbe();
+    }
+
+    private void scheduleProbe() {
+        if (closed || finishing || fatal || !suspended || probeScheduled) return;
+
+        // Fail-open backstop: after too long churning the suspend/probe cycle, give up streaming for
+        // this recording rather than tying up the radio forever. The file on disk is the truth.
+        if (config.suspendMaxTotalSec > 0 && totalSuspendedSec >= config.suspendMaxTotalSec) {
+            finalState = "suspend_gave_up";
+            JSObject e = new JSObject();
+            e.put("type", "error");
+            e.put("reason", "suspend_gave_up");
+            e.put("droppedFrames", framesDropped);
+            emitRaw(e);
+            teardown(true, 1000, "suspend_gave_up");
+            return;
+        }
+
+        probeScheduled = true;
+        final double cooldown = currentCooldownSec;
+        finalState = "suspended";
+        probeFuture = schedule(() -> {
+            if (closed || finishing || fatal || !suspended) return;
+            probeScheduled = false;
+            totalSuspendedSec += cooldown;
+            // Still offline: don't waste a probe (connect() would early-return on waiting_network).
+            // Stay suspended and re-arm — onNetwork also wakes, and totalSuspendedSec keeps climbing.
+            if (config.requireReachability && !hasNetwork) {
+                scheduleProbe();
+                return;
+            }
+            // One probe attempt. Success → markConnected resets cooldown + emits "resumed".
+            // Failure → handleDisconnect → scheduleReconnect sees probing and re-suspends.
+            suspended = false;
+            probing = true;
+            reconnectAttempt = 0;
+            finalState = "probing";
+            JSObject e = new JSObject();
+            e.put("type", "reconnecting");
+            e.put("attempt", 0);
+            e.put("reason", "probe");
+            e.put("backoffMs", 0);
+            emitRaw(e);
+            connect();
+        }, (long) (cooldown * 1000));
+    }
+
+    /** Suspend when, while connected, frames drop faster than the configured rate over a sustained
+     *  window. Connected-only so the pre-connect buffer warm-up never false-triggers. */
+    private void evaluateDropTrigger() {
+        if (!config.autosuspendEnabled || !connected || suspended || probing) return;
+        long now = System.currentTimeMillis();
+        if (dropWindowStartMs == 0) {
+            dropWindowStartMs = now;
+            dropWindowStartCount = framesDropped;
+            return;
+        }
+        double elapsed = (now - dropWindowStartMs) / 1000.0;
+        if (elapsed < Math.max(1, config.suspendDropWindowSec)) return;
+        double rate = (framesDropped - dropWindowStartCount) / elapsed;
+        if (rate >= Math.max(1, config.suspendDropRateFps)) {
+            enterSuspend("sustained_drops");
+        } else {
+            dropWindowStartMs = now;
+            dropWindowStartCount = framesDropped;
+        }
+    }
+
     private void onNetwork(boolean up) {
         boolean cameBack = up && !hasNetwork;
         hasNetwork = up;
@@ -350,7 +495,23 @@ public class AudioStreamSink {
 
         if (cameBack) {
             reconnectAttempt = 0;
-            if (!connected) {
+            if (suspended) {
+                // Physical network return always overrides the cooldown. Leave suspend and probe
+                // now; the queued probe (if any) bails because !suspended. probing=true so a
+                // failure re-enters suspend rather than the normal backoff.
+                suspended = false;
+                probing = true;
+                probeScheduled = false;
+                if (probeFuture != null) { probeFuture.cancel(false); probeFuture = null; }
+                currentCooldownSec = 0;
+                JSObject e = new JSObject();
+                e.put("type", "reconnecting");
+                e.put("attempt", 0);
+                e.put("reason", "network_restored");
+                e.put("backoffMs", 0);
+                emitRaw(e);
+                connect();
+            } else if (!connected) {
                 JSObject e = new JSObject();
                 e.put("type", "reconnecting");
                 e.put("attempt", 0);
@@ -413,6 +574,10 @@ public class AudioStreamSink {
         if (reconnectFuture != null) {
             reconnectFuture.cancel(false);
             reconnectFuture = null;
+        }
+        if (probeFuture != null) {
+            probeFuture.cancel(false);
+            probeFuture = null;
         }
         unregisterNetworkCallback();
         if (webSocket != null) {

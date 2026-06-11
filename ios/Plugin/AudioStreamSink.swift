@@ -34,6 +34,15 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
     private let requireReachability: Bool
     private let maxBufferedFrames: Int
 
+    // Auto-suspend tunables (resolved from config; all no-ops when !autosuspendEnabled).
+    private let autosuspendEnabled: Bool
+    private let suspendAfterReconnects: Int
+    private let suspendDropRateFps: Double
+    private let suspendDropWindowSec: Double
+    private let suspendCooldownSec: Double
+    private let suspendMaxCooldownSec: Double
+    private let suspendMaxTotalSec: Double
+
     private let queue = DispatchQueue(label: "com.capacitor.voicerecorder.streamsink")
     private var session: URLSession!
     private var task: URLSessionWebSocketTask?
@@ -62,6 +71,16 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
     private var finalState = "init"
     private var lastDropEventAt: Date?
 
+    // Auto-suspend runtime state (all on `queue`).
+    private var isSuspended = false
+    private var isProbing = false
+    private var probeScheduled = false
+    private var currentCooldown: Double = 0     // grows ×2 per failed probe, capped
+    private var totalSuspendedSec: Double = 0    // accumulates toward suspendMaxTotalSec
+    private var suspends: Int = 0
+    private var dropWindowStart: Date?           // start of the current drop-rate measurement window
+    private var dropWindowStartCount: UInt64 = 0 // framesDropped at window start
+
     init(config: StreamingConfig,
          sampleRate: Double,
          channels: Int,
@@ -78,6 +97,14 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
         self.maxAttempts = max(0, config.reconnectMaxAttempts)
         self.pingInterval = max(0, Double(config.pingIntervalMs) / 1000.0)
         self.requireReachability = config.requireReachability
+
+        self.autosuspendEnabled = config.autosuspendEnabled
+        self.suspendAfterReconnects = max(1, config.suspendAfterReconnects)
+        self.suspendDropRateFps = max(1, config.suspendDropRateFps)
+        self.suspendDropWindowSec = max(1, config.suspendDropWindowSec)
+        self.suspendCooldownSec = max(1, config.suspendCooldownSec)
+        self.suspendMaxCooldownSec = max(config.suspendCooldownSec, config.suspendMaxCooldownSec)
+        self.suspendMaxTotalSec = max(0, config.suspendMaxTotalSec)
 
         let framesPerSecond = sampleRate > 0 ? sampleRate / 1024.0 : 47.0
         let frames = Int((max(1.0, config.maxBufferSeconds) * framesPerSecond).rounded())
@@ -115,6 +142,14 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
         queue.async { [weak self] in
             guard let self = self, !self.isClosed, !self.isFinishing, !self.isFatal else { return }
 
+            // Suspended: don't buffer or send — just count the loss (bounded, no growth). The
+            // on-disk file is unaffected; we resume on probe / network return.
+            if self.isSuspended {
+                self.framesDropped &+= 1
+                self.noteDropThrottled()
+                return
+            }
+
             var payload = Data(capacity: 8 + adts.count)
             var beSeq = seq.bigEndian
             var beTs = timestampMs.bigEndian
@@ -126,6 +161,7 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
                 self.pending.removeFirst()
                 self.framesDropped &+= 1
                 self.noteDropThrottled()
+                self.evaluateDropTrigger()
             }
             self.pending.append(payload)
             self.pumpIfPossible()
@@ -166,7 +202,8 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
                 "framesSent": self.framesSent,
                 "framesDropped": self.framesDropped,
                 "bytesSent": self.bytesSent,
-                "reconnects": self.reconnects
+                "reconnects": self.reconnects,
+                "suspends": self.suspends
             ]
             if let lastError = self.lastError { snapshot["lastError"] = lastError }
         }
@@ -206,6 +243,15 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
         if reconnectAttempt > 0 { reconnects += 1 }
         reconnectAttempt = 0
         finalState = "connected"
+        // A probe (or network-restored wake) that lands here means the link is back: reset the
+        // backoff/cooldown and tell the JS layer streaming resumed.
+        if isProbing {
+            isProbing = false
+            currentCooldown = 0
+            emit(["type": "resumed", "droppedFrames": framesDropped, "reconnects": reconnects])
+        }
+        // Start a fresh drop-rate window for the (re)connected session.
+        dropWindowStart = nil
         sendStart()
         emit(["type": "connected"])
         pumpIfPossible()
@@ -357,6 +403,21 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
     private func scheduleReconnect() {
         guard !isClosed, !isFinishing, !isFatal, !reconnectScheduled else { return }
 
+        // A failed PROBE while suspended: re-suspend (cooldown already doubling) instead of the
+        // normal backoff cycle.
+        if isProbing {
+            isProbing = false
+            enterSuspend(reason: "probe_failed")
+            return
+        }
+
+        // Reconnect storm: after N consecutive attempts the link is effectively dead — stop churning
+        // TLS/WS handshakes and drop into the suspend/cooldown cycle. Opt-in.
+        if autosuspendEnabled && !isSuspended && reconnectAttempt >= suspendAfterReconnects {
+            enterSuspend(reason: "reconnect_storm")
+            return
+        }
+
         if maxAttempts > 0 && reconnectAttempt >= maxAttempts {
             isFatal = true
             finalState = "fatal"
@@ -381,6 +442,99 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
         }
     }
 
+    // MARK: - Auto-suspend (all on `queue`)
+
+    /// Enter the suspended state: tear down the live task, stop pinging, park for a cooldown, then
+    /// probe once. Cooldown doubles per failed probe (capped). Streaming only — recording untouched.
+    private func enterSuspend(reason: String) {
+        guard !isClosed, !isFinishing, !isFatal, !isSuspended else { return }
+        isSuspended = true
+        isProbing = false
+        suspends += 1
+        finalState = "suspended"
+
+        // Drop the live connection but keep the sink alive.
+        isConnected = false
+        isSending = false
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
+        reconnectScheduled = false
+        dropWindowStart = nil
+
+        currentCooldown = currentCooldown <= 0
+            ? suspendCooldownSec
+            : min(suspendMaxCooldownSec, currentCooldown * 2)
+
+        emit([
+            "type": "suspended",
+            "reason": reason,
+            "droppedFrames": framesDropped,
+            "reconnects": reconnects,
+            "cooldownMs": Int(currentCooldown * 1000)
+        ])
+        scheduleProbe()
+    }
+
+    private func scheduleProbe() {
+        guard !isClosed, !isFinishing, !isFatal, isSuspended, !probeScheduled else { return }
+
+        // Fail-open backstop: after too long churning the suspend/probe cycle, give up streaming for
+        // this recording rather than tying up the radio forever. The file on disk is the truth.
+        if suspendMaxTotalSec > 0 && totalSuspendedSec >= suspendMaxTotalSec {
+            finalState = "suspend_gave_up"
+            emit(["type": "error", "reason": "suspend_gave_up", "droppedFrames": framesDropped])
+            teardown(closeCode: .normalClosure)
+            return
+        }
+
+        probeScheduled = true
+        let cooldown = currentCooldown
+        finalState = "suspended"
+        queue.asyncAfter(deadline: .now() + cooldown) { [weak self] in
+            guard let self = self, !self.isClosed, !self.isFinishing, !self.isFatal, self.isSuspended else { return }
+            self.probeScheduled = false
+            self.totalSuspendedSec += cooldown
+            // Still offline: don't waste a probe (connect() would early-return on waiting_network and
+            // leave us in limbo). Stay suspended and re-arm — handlePathUpdate also wakes on return,
+            // and totalSuspendedSec keeps climbing toward the fail-open backstop.
+            if self.requireReachability && !self.hasNetwork {
+                self.scheduleProbe()
+                return
+            }
+            // One probe attempt. Success → markConnected resets cooldown + emits "resumed".
+            // Failure → handleDisconnect → scheduleReconnect sees isProbing and re-suspends.
+            self.isSuspended = false
+            self.isProbing = true
+            self.reconnectAttempt = 0
+            self.finalState = "probing"
+            self.emit(["type": "reconnecting", "attempt": 0, "reason": "probe", "backoffMs": 0])
+            self.connect()
+        }
+    }
+
+    /// Suspend when, while connected, frames are dropping faster than the configured rate over a
+    /// sustained window (connection up but throughput below audio production). Connected-only so the
+    /// pre-connect buffer warm-up never false-triggers.
+    private func evaluateDropTrigger() {
+        guard autosuspendEnabled, isConnected, !isSuspended, !isProbing else { return }
+        let now = Date()
+        guard let windowStart = dropWindowStart else {
+            dropWindowStart = now
+            dropWindowStartCount = framesDropped
+            return
+        }
+        let elapsed = now.timeIntervalSince(windowStart)
+        guard elapsed >= suspendDropWindowSec else { return }
+        let droppedInWindow = framesDropped &- dropWindowStartCount
+        let rate = Double(droppedInWindow) / elapsed
+        if rate >= suspendDropRateFps {
+            enterSuspend(reason: "sustained_drops")
+        } else {
+            dropWindowStart = now
+            dropWindowStartCount = framesDropped
+        }
+    }
+
     private func handlePathUpdate(_ path: NWPath) {
         let nowHas = path.status == .satisfied
         let cameBack = nowHas && !hasNetwork
@@ -391,7 +545,17 @@ final class AudioStreamSink: NSObject, URLSessionWebSocketDelegate {
             // Network restored — reconnect immediately and reset backoff.
             reconnectAttempt = 0
             reconnectScheduled = false
-            if !isConnected {
+            if isSuspended {
+                // Physical network return always overrides the cooldown. Leave suspend and probe
+                // now; the queued probe closure will bail (guards on isSuspended). isProbing=true
+                // so a failure re-enters suspend rather than the normal backoff.
+                isSuspended = false
+                isProbing = true
+                probeScheduled = false
+                currentCooldown = 0
+                emit(["type": "reconnecting", "attempt": 0, "reason": "network_restored", "backoffMs": 0])
+                connect()
+            } else if !isConnected {
                 emit(["type": "reconnecting", "attempt": 0, "reason": "network_restored", "backoffMs": 0])
                 connect()
             }
