@@ -232,6 +232,15 @@ export interface VoiceRecorderPlugin {
   getCurrentStatus(): Promise<CurrentRecordingStatus>;
 
   /**
+   * iOS only (Android/web always resolve `{ value: false }`). Returns whether the device screen
+   * is currently being captured/broadcast/mirrored — ReplayKit screen-share (Zoom/Teams), AirPlay
+   * mirroring, or Control Center screen recording. This is a SCREEN signal, orthogonal to audio:
+   * our own microphone recording never sets it, nor does another app merely playing audio. The app
+   * uses it to skip auto-starting a recording while true, avoiding the ReplayKit audio-session crash.
+   */
+  isScreenCaptured(): Promise<GenericResponse>;
+
+  /**
    * Returns timestamps captured by the native AppDelegate lifecycle hooks plus a
    * derived abnormal_restart_pending flag. Used once on cold start to log the
    * previous process's outcome to person_app_logs. Web stub returns zeros.

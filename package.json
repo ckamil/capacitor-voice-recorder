@@ -1,6 +1,6 @@
 {
   "name": "c",
-  "version": "7.1.0-interruption.1",
+  "version": "7.1.0-screencapture.1",
   "description": "Capacitor plugin for voice recording with interruption handling",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",

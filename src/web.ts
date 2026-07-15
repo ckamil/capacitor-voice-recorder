@@ -51,6 +51,10 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
     return this.voiceRecorderInstance.getCurrentStatus();
   }
 
+  public isScreenCaptured(): Promise<GenericResponse> {
+    return Promise.resolve({ value: false });
+  }
+
   public getLifecycleSnapshot(): Promise<LifecycleSnapshot> {
     return Promise.resolve({
       last_background_at_ms: 0,

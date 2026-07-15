@@ -20,6 +20,12 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
     // their own queue so a slow/failing network cannot delay the file writes on writeQueue.
     // Set by VoiceRecorder before startRecording so streaming lifecycle events reach the JS layer.
     var onStreamEvent: (([String: Any]) -> Void)?
+
+    // Called when the engine cannot be restarted after a configuration change AND the screen is
+    // being captured (ReplayKit screen-share seized the audio session). Lets VoiceRecorder finalize
+    // the partial recording via the JS layer instead of leaving a stuck engine recording silence.
+    // Only fires for the screen-capture case — ordinary route changes keep the legacy behaviour.
+    var onEngineUnrecoverable: ((String) -> Void)?
     private var streamEncoder: AacFrameEncoder?
     private var streamSink: AudioStreamSink?
     private var streamTailReader: AdtsFileTailReader?   // used only in .fileTail mode
@@ -263,12 +269,38 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
                 return openFailure
             }
 
-            // Install tap to capture audio buffers and encode them to AAC.
-            installInputTap()
+            // Install the tap and start the engine inside an Objective-C exception guard.
+            // AVAudioEngine.start()/installTap can raise a CoreAudio NSException (NOT a Swift
+            // Error) when the shared audio session is held by another process — e.g. Zoom/Teams
+            // screen-share via ReplayKit. Swift's do/catch cannot catch NSException, so without
+            // this guard the whole app crashes. On failure we return a structured failure so
+            // VoiceRecorder falls back to the legacy AVAudioRecorder path (which does not use
+            // AVAudioEngine and degrades safely under a hijacked session). NOTE: keep the Swift
+            // `try` inside a do/catch here (not `try?`) so a Swift Error still routes to the same
+            // failure/fallback — swallowing it would leave a dead engine reported as success.
+            var engineStartSwiftError: Error?
+            var engineStartNSError: NSError?
+            let engineStarted = ObjCExceptionGuard.tryBlock({
+                self.installInputTap()
+                self.audioEngine.prepare()
+                do { try self.audioEngine.start() } catch { engineStartSwiftError = error }
+            }, error: &engineStartNSError)
 
-            // Start the engine
-            audioEngine.prepare()
-            try audioEngine.start()
+            if !engineStarted || engineStartSwiftError != nil {
+                cleanupAfterFailedStart()
+                return RecordingResult.failure(
+                    stage: "engine_start_exception",
+                    details: [
+                        "recorderType": "engine",
+                        "nsException": engineStartNSError?.localizedDescription ?? "none",
+                        "exceptionName": (engineStartNSError?.userInfo["exceptionName"] as? String) ?? "none",
+                        "swiftError": (engineStartSwiftError as NSError?)?.localizedDescription ?? "none"
+                    ],
+                    errorDescription: engineStartNSError?.localizedDescription
+                        ?? engineStartSwiftError?.localizedDescription
+                        ?? "engine start failed"
+                )
+            }
 
             // Recover from route/sample-rate changes (Bluetooth/headphones connect, WebView
             // reconfiguring the shared session, etc.) which make iOS STOP the engine. Without
@@ -457,16 +489,40 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
               let engine = audioEngine else { return }
         if engine.isRunning { return } // engine survived the change — nothing to do
         NSLog("AudioEngineRecorder: configuration change — engine stopped, attempting restart")
-        try? recordingSession?.setActive(true)
-        installInputTap()
-        engine.prepare()
-        do {
-            try engine.start()
+
+        // Restart inside the ObjC exception guard: a configuration change caused by ReplayKit
+        // screen-share (Zoom/Teams) grabbing the audio session makes installTap/start raise a
+        // CoreAudio NSException, which would crash the app. Catch it and end the recording
+        // gracefully (same outcome as the pre-existing Swift-error path).
+        var restartSwiftError: Error?
+        var restartNSError: NSError?
+        let restarted = ObjCExceptionGuard.tryBlock({
+            try? self.recordingSession?.setActive(true)
+            self.installInputTap()
+            engine.prepare()
+            do { try engine.start() } catch { restartSwiftError = error }
+        }, error: &restartNSError)
+
+        if restarted && restartSwiftError == nil {
             engineRestartCount += 1
             NSLog("AudioEngineRecorder: engine restarted after configuration change (#%d)", engineRestartCount)
-        } catch {
-            NSLog("AudioEngineRecorder: engine restart FAILED after configuration change: %@", error.localizedDescription)
-            lastWriteError = "engine_restart_failed: \(error.localizedDescription)"
+            return
+        }
+
+        let reason = restartNSError?.localizedDescription ?? restartSwiftError?.localizedDescription ?? "unknown"
+        NSLog("AudioEngineRecorder: engine restart FAILED after configuration change: %@", reason)
+        lastWriteError = "engine_restart_failed: \(reason)"
+
+        // Only when the failure coincides with the screen being captured (ReplayKit) do we
+        // proactively finalize the partial recording through the JS layer — otherwise a stuck
+        // engine keeps "recording" silence until manual stop. For ordinary route changes
+        // (Bluetooth/headset connect/disconnect) we keep the pre-existing behaviour untouched
+        // (leave it for a later config change to recover), so this cannot regress everyday
+        // recordings. UIScreen must be read on the main thread.
+        DispatchQueue.main.async { [weak self] in
+            if UIScreen.main.isCaptured {
+                self?.onEngineUnrecoverable?("engine_restart_failed_screen_capture")
+            }
         }
     }
 

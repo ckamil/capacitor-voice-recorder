@@ -61,6 +61,17 @@ public class VoiceRecorder: CAPPlugin {
         call.resolve(ResponseGenerator.fromBoolean(doesUserGaveAudioRecordingPermission()))
     }
 
+    /// Returns whether the device screen is currently being captured/broadcast/mirrored
+    /// (ReplayKit screen-share e.g. Zoom/Teams, AirPlay mirroring, Control Center screen
+    /// recording). This is a SCREEN signal, orthogonal to audio: our own microphone recording
+    /// never sets it, and another app merely playing audio does not either. The app skips
+    /// auto-starting a recording while true to avoid the ReplayKit audio-session crash.
+    @objc func isScreenCaptured(_ call: CAPPluginCall) {
+        DispatchQueue.main.async {
+            call.resolve(ResponseGenerator.fromBoolean(UIScreen.main.isCaptured))
+        }
+    }
+
     @objc func startRecording(_ call: CAPPluginCall) {
         if !doesUserGaveAudioRecordingPermission() {
             rejectWithDiagnostics(call,
@@ -121,6 +132,11 @@ public class VoiceRecorder: CAPPlugin {
             // startRecording so connect/error events emitted during setup are delivered.
             engineRecorder.onStreamEvent = { [weak self] event in
                 self?.notifyListeners("recordingStreamEvent", data: event)
+            }
+            // If the engine cannot be restarted after a configuration change caused by the screen
+            // being captured (ReplayKit screen-share), finalize the partial recording via JS.
+            engineRecorder.onEngineUnrecoverable = { [weak self] reason in
+                self?.handleEngineUnrecoverable(reason)
             }
             let engineResult = engineRecorder.startRecording(recordOptions: recordOptions)
 
@@ -1007,6 +1023,25 @@ public class VoiceRecorder: CAPPlugin {
         for (k, v) in gatherInterruptionContext() { payload[k] = v }
 
         NSLog("VoiceRecorder: Sending recordingInterrupted - reason: media_services_reset")
+        notifyListeners("recordingInterrupted", data: ["data": payload])
+    }
+
+    /// The AudioEngine could not be restarted after a configuration change AND the screen is being
+    /// captured (ReplayKit screen-share seized the audio session). Surface it as a recording
+    /// interruption so the JS layer finalizes the partial recording instead of leaving a stuck
+    /// engine recording silence. Mirrors handleMediaServicesWereReset's payload shape.
+    func handleEngineUnrecoverable(_ reason: String) {
+        guard customMediaRecorder != nil else { return }
+
+        isInterrupted = true
+        var payload: [String: Any] = [
+            "reason": reason,
+            "timestamp": ISO8601DateFormatter().string(from: Date()),
+            "source": "engine_configuration_change"
+        ]
+        for (k, v) in gatherInterruptionContext() { payload[k] = v }
+
+        NSLog("VoiceRecorder: Sending recordingInterrupted - reason: %@", reason)
         notifyListeners("recordingInterrupted", data: ["data": payload])
     }
 

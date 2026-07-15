@@ -65,6 +65,13 @@ public class VoiceRecorder extends Plugin {
         call.resolve(ResponseGenerator.fromBoolean(doesUserGaveAudioRecordingPermission()));
     }
 
+    // Screen-capture detection is an iOS/ReplayKit concern (Zoom screen-share crash). Android has
+    // no equivalent audio-session hijack, so this is a no-op that always reports false.
+    @PluginMethod
+    public void isScreenCaptured(PluginCall call) {
+        call.resolve(ResponseGenerator.fromBoolean(false));
+    }
+
     @PluginMethod
     public void startRecording(PluginCall call) {
         if (!CustomMediaRecorder.canPhoneCreateMediaRecorder(getContext())) {
