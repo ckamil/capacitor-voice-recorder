@@ -14,7 +14,9 @@ NS_ASSUME_NONNULL_BEGIN
 /// (in which case `error` is populated with the exception name/reason).
 /// NS_SWIFT_NOTHROW keeps the explicit BOOL-return + error out-param signature in Swift
 /// (otherwise the trailing NSError** would be imported as a throwing method).
-+ (BOOL)tryBlock:(void (NS_NOESCAPE ^)(void))block error:(NSError *_Nullable *_Nullable)error NS_SWIFT_NOTHROW;
+/// NS_SWIFT_NAME pins the Swift name — the importer otherwise strips the "Block" suffix
+/// and exposes it as `try(_:error:)`, which is diagnosed as an obsoleted Swift 3 rename.
++ (BOOL)tryBlock:(void (NS_NOESCAPE ^)(void))block error:(NSError *_Nullable *_Nullable)error NS_SWIFT_NOTHROW NS_SWIFT_NAME(tryBlock(_:error:));
 
 @end
 
