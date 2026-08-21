@@ -101,11 +101,42 @@ export interface StreamingOptions {
   autosuspend?: StreamingAutosuspendOptions;
 }
 
+/**
+ * Android only. Which `MediaRecorder.AudioSource` to open.
+ *
+ * `UNPROCESSED` is an OPTIONAL source — a device only really provides it when it advertises
+ * `AudioManager.PROPERTY_SUPPORT_AUDIO_SOURCE_UNPROCESSED`. Asking for it on a device that does
+ * not results in an ungained raw capture path: the file has the right duration, the right size
+ * and no speech in it. Hence the default never selects it.
+ *
+ * - `auto` (default) / `voice_recognition` — VOICE_RECOGNITION. Mandatory-supported, and specified
+ *   to run without AGC or noise suppression, so speaker audio from presentations is not filtered
+ *   and there are no AGC artifacts.
+ * - `unprocessed` — UNPROCESSED, but only when the device advertises support; otherwise falls back
+ *   to VOICE_RECOGNITION.
+ * - `unprocessed_force` — UNPROCESSED unconditionally. On-device diagnosis only; this is the
+ *   configuration that produced silent recordings in the field.
+ * - `mic` — MIC. The processed path, with AGC.
+ * - `voice_communication` — VOICE_COMMUNICATION. AEC-tuned, for call-like capture.
+ */
+export type AndroidAudioSource = 'auto' | 'voice_recognition' | 'unprocessed' | 'unprocessed_force' | 'mic' | 'voice_communication';
+
 export type RecordingOptions =
   | never
   | {
       directory: Directory;
       subDirectory?: string;
+      /**
+       * Android only (iOS ignores it and should not send it). Capture source for MediaRecorder.
+       * Drive from SettingsService for remote control. Default 'auto'.
+       */
+      androidAudioSource?: AndroidAudioSource;
+      /**
+       * Android only. Peak PCM amplitude (0..32767) below which the finished recording is reported
+       * as `silent` in the stop diagnostics. Observability only — it never alters the recording.
+       * Default 200.
+       */
+      androidSilenceThreshold?: number;
       // When true, ambiguous audio-session interruptions (no reason / unknown reason /
       // iOS < 14.5) let the recording CONTINUE (relying on the native engine auto-restart)
       // instead of stopping. Default false. Drive from SettingsService for remote control.

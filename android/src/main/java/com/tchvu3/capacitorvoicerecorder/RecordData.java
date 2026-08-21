@@ -46,6 +46,11 @@ public class RecordData {
     private JSObject streamingDiagnostics;
     private JSObject audioConfig;
     private String route;
+    private String audioSource;
+    private String audioSourceRequested;
+    private Boolean unprocessedSupported;
+    private Integer peakAmplitude;
+    private Boolean silent;
 
     public void setFileSize(long fileSize) {
         this.fileSize = fileSize;
@@ -61,6 +66,25 @@ public class RecordData {
 
     public void setRoute(String route) {
         this.route = route;
+    }
+
+    /**
+     * Capture-path diagnostics: which MediaRecorder.AudioSource was actually opened, which one was
+     * asked for, and whether the device advertises UNPROCESSED support. Surfaced so a repeat of the
+     * silent-capture regression is visible in recordings.diagnostics, not only in the audio.
+     */
+    public void setAudioSourceInfo(String resolved, String requested, boolean unprocessedSupported) {
+        this.audioSource = resolved;
+        this.audioSourceRequested = requested;
+        this.unprocessedSupported = unprocessedSupported;
+    }
+
+    /** Peak PCM amplitude over the recording (0..32767); pass -1 for "never sampled". */
+    public void setPeakAmplitude(int peakAmplitude, boolean silent) {
+        if (peakAmplitude >= 0) {
+            this.peakAmplitude = peakAmplitude;
+            this.silent = silent;
+        }
     }
 
     public JSObject toJSObject() {
@@ -84,6 +108,15 @@ public class RecordData {
         }
         if (route != null) {
             diagnostics.put("route", route);
+        }
+        if (audioSource != null) {
+            diagnostics.put("audioSource", audioSource);
+            diagnostics.put("audioSourceRequested", audioSourceRequested);
+            diagnostics.put("unprocessedSupported", unprocessedSupported);
+        }
+        if (peakAmplitude != null) {
+            diagnostics.put("peakAmplitude", (int) peakAmplitude);
+            diagnostics.put("silent", (boolean) silent);
         }
         toReturn.put("diagnostics", diagnostics);
 

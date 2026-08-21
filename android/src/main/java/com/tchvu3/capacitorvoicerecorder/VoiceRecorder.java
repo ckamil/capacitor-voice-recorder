@@ -112,6 +112,13 @@ public class VoiceRecorder extends Plugin {
             String subDirectory = call.getString("subDirectory");
             RecordOptions options = new RecordOptions(directory, subDirectory);
             options.setStreaming(StreamingConfig.fromJSObject(call.getObject("streaming")));
+            // Android-only capture tuning. Both are optional and remote-controlled from
+            // SettingsService; omitted (iOS never sends them) means the safe defaults.
+            options.setAudioSource(call.getString("androidAudioSource"));
+            Integer silenceThreshold = call.getInt("androidSilenceThreshold", CustomMediaRecorder.DEFAULT_SILENCE_THRESHOLD);
+            if (silenceThreshold != null) {
+                options.setSilenceThreshold(silenceThreshold);
+            }
             mediaRecorder = new CustomMediaRecorder(getContext(), options);
             // Forward live-streaming lifecycle events to JS for logging. Set before startRecording
             // so connect/error events emitted during setup are delivered.
@@ -182,6 +189,17 @@ public class VoiceRecorder extends Plugin {
                 if (route != null) {
                     recordData.setRoute(route);
                 }
+            } catch (Exception ignored) {}
+            try {
+                // Capture path + measured level. A recording whose peak never leaves the floor is
+                // the exact signature of the AMA-338 UNPROCESSED regression: correct duration,
+                // correct file size, no audio. Reporting it makes that state detectable server-side.
+                recordData.setAudioSourceInfo(
+                    mediaRecorder.getResolvedAudioSourceName(),
+                    mediaRecorder.getRequestedAudioSource(),
+                    mediaRecorder.isUnprocessedSupportedOnDevice()
+                );
+                recordData.setPeakAmplitude(mediaRecorder.getPeakAmplitude(), mediaRecorder.isSilent());
             } catch (Exception ignored) {}
 
             if ((recordDataBase64 == null && path == null) || recordData.getMsDuration() < 0) {
