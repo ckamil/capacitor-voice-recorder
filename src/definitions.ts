@@ -245,6 +245,21 @@ export interface RecordingStreamEvent {
   reconnects?: number;
 }
 
+export interface MicrophoneBusyResponse {
+  /** True when another process holds the microphone (see `isMicrophoneBusy`). */
+  value: boolean;
+  /** `call` when a live call was detected, `none` otherwise. Diagnostics only. */
+  reason?: 'call' | 'none';
+  /** iOS: number of live CallKit calls. Diagnostics only. */
+  activeCalls?: number;
+  /** iOS: `AVAudioSession.isOtherAudioPlaying` at the time of the check. Diagnostics only. */
+  otherAudioPlaying?: boolean;
+  /** iOS: `AVAudioSession.isInputAvailable` at the time of the check. Diagnostics only. */
+  isInputAvailable?: boolean;
+  /** Android: `AudioManager.getMode()` at the time of the check. Diagnostics only. */
+  audioMode?: number;
+}
+
 export interface VoiceRecorderPlugin {
   canDeviceVoiceRecord(): Promise<GenericResponse>;
 
@@ -270,6 +285,21 @@ export interface VoiceRecorderPlugin {
    * uses it to skip auto-starting a recording while true, avoiding the ReplayKit audio-session crash.
    */
   isScreenCaptured(): Promise<GenericResponse>;
+
+  /**
+   * Whether something outside the app is holding the microphone right now.
+   *
+   * iOS: a live CallKit call — a cellular call, or a VoIP app that registers with CallKit
+   * (Teams, WhatsApp, FaceTime). It is deliberately NOT "other audio is playing": that would
+   * also be true for our own presentation video and would block legitimate recordings. A
+   * Zoom/Teams *meeting* is not a CallKit call and reads false — screen-shared meetings are
+   * covered by {@link isScreenCaptured} instead.
+   *
+   * Android: mirrors the condition `startRecording` already refuses on
+   * (`AudioManager.getMode() != MODE_NORMAL` → `MICROPHONE_BEING_USED`), so the JS layer can ask
+   * first and explain, rather than surfacing a native rejection. Web: always false.
+   */
+  isMicrophoneBusy(): Promise<MicrophoneBusyResponse>;
 
   /**
    * Returns timestamps captured by the native AppDelegate lifecycle hooks plus a

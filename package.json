@@ -1,6 +1,6 @@
 {
   "name": "c",
-  "version": "7.1.0-audiosource.1",
+  "version": "7.1.0-callguard.1",
   "description": "Capacitor plugin for voice recording with interruption handling",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",

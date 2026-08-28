@@ -220,10 +220,47 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             let timestamp = Int(Date().timeIntervalSince1970 * 1000)
             aacFileURL = outputDir.appendingPathComponent("recording-\(timestamp).aac")
 
-            // Set up AVAudioEngine
-            audioEngine = AVAudioEngine()
-            let inputNode = audioEngine.inputNode
-            let inputFormat = inputNode.outputFormat(forBus: 0)
+            // Set up AVAudioEngine. Constructing the engine and reading the hardware input
+            // format are themselves CoreAudio calls that raise an Objective-C NSException (NOT a
+            // Swift Error) when the shared session cannot hand over a valid input — another
+            // process holding the microphone is the usual cause: a phone/VoIP call, or a
+            // ReplayKit broadcast (Zoom/Teams screen-share). Swift's do/catch cannot catch that,
+            // so this pair used to take the whole app down BEFORE reaching the guarded
+            // installTap/start below. Guard it the same way and let VoiceRecorder fall back to
+            // the legacy AVAudioRecorder path.
+            var createdEngine: AVAudioEngine?
+            var probedFormat: AVAudioFormat?
+            var engineInitNSError: NSError?
+            let engineInitialised = ObjCExceptionGuard.tryBlock({
+                let engine = AVAudioEngine()
+                createdEngine = engine
+                probedFormat = engine.inputNode.outputFormat(forBus: 0)
+            }, error: &engineInitNSError)
+
+            guard engineInitialised, let engine = createdEngine, let inputFormat = probedFormat else {
+                // Deliberately do NOT adopt a half-built engine: cleanupAfterFailedStart would
+                // touch `inputNode` again, i.e. re-enter the very call that just threw. Dropping
+                // the local reference is enough — ARC tears down an engine that was never
+                // started, and cleanup still restores the audio session for the legacy fallback.
+                cleanupAfterFailedStart()
+                return RecordingResult.failure(
+                    stage: "engine_init_exception",
+                    details: [
+                        "recorderType": "engine",
+                        "nsException": engineInitNSError?.localizedDescription ?? "none",
+                        "exceptionName": (engineInitNSError?.userInfo["exceptionName"] as? String) ?? "none",
+                        "isInputAvailable": recordingSession.isInputAvailable,
+                        "currentInputs": recordingSession.currentRoute.inputs.map { $0.portType.rawValue },
+                        "availableInputs": recordingSession.availableInputs?.map { $0.portType.rawValue } ?? [],
+                        "otherAudioPlaying": recordingSession.isOtherAudioPlaying,
+                        "deviceModel": deviceInfo["model"] ?? "unknown",
+                        "iosVersion": deviceInfo["systemVersion"] ?? "unknown"
+                    ],
+                    errorDescription: engineInitNSError?.localizedDescription
+                        ?? "AVAudioEngine init / input format read failed"
+                )
+            }
+            audioEngine = engine
 
             guard inputFormat.sampleRate > 0 && inputFormat.channelCount > 0 else {
                 cleanupAfterFailedStart()
@@ -546,12 +583,23 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
         }
 
         NSLog("AudioEngineRecorder: stop [A] removing tap")
-        // Stop engine and remove tap
+        // Stop engine and remove tap. Guarded for the same reason the start is: tearing the tap
+        // down while another process holds the session can raise a CoreAudio NSException, and
+        // losing the app here would also lose the recording we are in the middle of finalizing.
+        // On a throw we keep going — the AAC file below is closed either way.
         if let engine = audioEngine {
-            engine.inputNode.removeTap(onBus: 0)
-            NSLog("AudioEngineRecorder: stop [B] tap removed, stopping engine")
-            engine.stop()
-            NSLog("AudioEngineRecorder: stop [C] engine stopped")
+            var teardownNSError: NSError?
+            let tornDown = ObjCExceptionGuard.tryBlock({
+                engine.inputNode.removeTap(onBus: 0)
+                NSLog("AudioEngineRecorder: stop [B] tap removed, stopping engine")
+                engine.stop()
+                NSLog("AudioEngineRecorder: stop [C] engine stopped")
+            }, error: &teardownNSError)
+            if !tornDown {
+                lastWriteError = "engine_teardown_exception: \(teardownNSError?.localizedDescription ?? "unknown")"
+                NSLog("AudioEngineRecorder: stop [B/C] teardown raised: %@",
+                      teardownNSError?.localizedDescription ?? "unknown")
+            }
         }
 
         // C2: drain any queued writes and finalize the AAC file on the SAME queue the tap
@@ -800,8 +848,16 @@ class AudioEngineRecorder: NSObject, RecorderInterface {
             streamEncoder = nil
         }
         if let engine = audioEngine {
-            engine.inputNode.removeTap(onBus: 0)
-            engine.stop()
+            // Same NSException risk as the stop path: this runs precisely when the session is
+            // already in a bad state, so a raw removeTap here could crash the cleanup itself.
+            var cleanupNSError: NSError?
+            _ = ObjCExceptionGuard.tryBlock({
+                engine.inputNode.removeTap(onBus: 0)
+                engine.stop()
+            }, error: &cleanupNSError)
+            if let err = cleanupNSError {
+                NSLog("AudioEngineRecorder: cleanup teardown raised: %@", err.localizedDescription)
+            }
         }
         audioEngine = nil
         recordingFormat = nil

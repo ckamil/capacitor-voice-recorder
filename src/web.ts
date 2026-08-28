@@ -10,6 +10,7 @@ import type {
   StartRecordingResponse,
   VoiceRecorderPlugin,
   MicrophoneAvailabilityEvent,
+  MicrophoneBusyResponse,
   RecordingInterruptionEvent,
   InterruptionEndedEvent,
   RecordingStreamEvent,
@@ -53,6 +54,10 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
 
   public isScreenCaptured(): Promise<GenericResponse> {
     return Promise.resolve({ value: false });
+  }
+
+  public isMicrophoneBusy(): Promise<MicrophoneBusyResponse> {
+    return Promise.resolve({ value: false, reason: 'none' });
   }
 
   public getLifecycleSnapshot(): Promise<LifecycleSnapshot> {

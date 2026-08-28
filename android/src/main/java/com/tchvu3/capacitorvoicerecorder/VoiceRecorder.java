@@ -72,6 +72,22 @@ public class VoiceRecorder extends Plugin {
         call.resolve(ResponseGenerator.fromBoolean(false));
     }
 
+    // Reports the same condition startRecording already refuses on (MICROPHONE_BEING_USED), so the
+    // JS layer can ask BEFORE starting and show the user why, instead of surfacing a native
+    // rejection. Answering here changes nothing about what the device will or will not record —
+    // the native gate below is unchanged and remains the authority.
+    @PluginMethod
+    public void isMicrophoneBusy(PluginCall call) {
+        AudioManager audioManager = (AudioManager) getContext().getSystemService(Context.AUDIO_SERVICE);
+        int mode = audioManager != null ? audioManager.getMode() : -1;
+        boolean busy = isMicrophoneOccupied();
+        JSObject result = new JSObject();
+        result.put("value", busy);
+        result.put("reason", busy ? "call" : "none");
+        result.put("audioMode", mode);
+        call.resolve(result);
+    }
+
     @PluginMethod
     public void startRecording(PluginCall call) {
         if (!CustomMediaRecorder.canPhoneCreateMediaRecorder(getContext())) {

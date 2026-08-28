@@ -15,4 +15,5 @@ CAP_PLUGIN(VoiceRecorder, "VoiceRecorder",
            CAP_PLUGIN_METHOD(getLifecycleSnapshot, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(clearAbnormalRestartFlag, CAPPluginReturnPromise);
            CAP_PLUGIN_METHOD(isScreenCaptured, CAPPluginReturnPromise);
+           CAP_PLUGIN_METHOD(isMicrophoneBusy, CAPPluginReturnPromise);
 )

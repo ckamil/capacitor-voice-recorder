@@ -72,6 +72,27 @@ public class VoiceRecorder: CAPPlugin {
         }
     }
 
+    /// Whether something OUTSIDE the app is holding the microphone right now. The signal is a
+    /// live CallKit call — the same one `handleRecordingInterruptionWithReason` already trusts to
+    /// tell a real phone/VoIP call from WebView video or background music, so a recording is never
+    /// refused for merely "other audio playing" (that would block our own presentations).
+    /// It covers cellular calls and VoIP apps that register with CallKit (Teams, WhatsApp,
+    /// FaceTime); a Zoom/Teams *meeting* is not a CallKit call and will read false here — those
+    /// are covered by isScreenCaptured() and by the native exception guard, not by this.
+    /// The extra fields are diagnostics for the JS log; the decision is `value`.
+    /// Never rejects: a guard that cannot answer must not be able to block a recording.
+    @objc func isMicrophoneBusy(_ call: CAPPluginCall) {
+        let session = AVAudioSession.sharedInstance()
+        let liveCalls = CXCallObserver().calls.filter { !$0.hasEnded }
+        call.resolve([
+            "value": !liveCalls.isEmpty,
+            "reason": liveCalls.isEmpty ? "none" : "call",
+            "activeCalls": liveCalls.count,
+            "otherAudioPlaying": session.isOtherAudioPlaying,
+            "isInputAvailable": session.isInputAvailable
+        ])
+    }
+
     @objc func startRecording(_ call: CAPPluginCall) {
         if !doesUserGaveAudioRecordingPermission() {
             rejectWithDiagnostics(call,
