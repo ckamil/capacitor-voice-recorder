@@ -36,6 +36,19 @@ public class VoiceRecorder extends Plugin {
     private AudioManager globalAudioManager;
     private AudioFocusRequest globalAudioFocusRequest;
     private boolean isMicrophoneCurrentlyAvailable = true;
+    // Whether the microphone foreground service was up for the recording currently in progress,
+    // and why not when it is not. Carried to the stop diagnostics so a recording that could only
+    // capture on screen says so in person_app_logs instead of being diagnosed months later.
+    private boolean micServiceStarted;
+    private String micServiceError;
+    // Whether the platform will actually hand that service the microphone. Separate from
+    // `micServiceStarted` on purpose: up to Android 13 a service started from the background comes
+    // up fine and gets no capability (measured on Android 12L), so collapsing the two would log a
+    // reassuring `true` for exactly the recordings that come back silent. From Android 14 the
+    // start from the background throws SecurityException instead (measured on Android 16): both
+    // flags are false and `micServiceError` carries the class name, reported as
+    // mic_foreground_service_error.
+    private boolean micCapabilityGranted;
 
     @PluginMethod
     public void canDeviceVoiceRecord(PluginCall call) {
@@ -135,16 +148,54 @@ public class VoiceRecorder extends Plugin {
             if (silenceThreshold != null) {
                 options.setSilenceThreshold(silenceThreshold);
             }
+            Double minCaptureRatio = call.getDouble("androidMinCaptureRatio");
+            if (minCaptureRatio != null) {
+                options.setMinCaptureRatio(minCaptureRatio);
+            }
             mediaRecorder = new CustomMediaRecorder(getContext(), options);
+
+            // Take the microphone foreground service BEFORE opening the recorder. RECORD_AUDIO is a
+            // while-in-use permission: without a service of type `microphone` the platform stops
+            // feeding the microphone the moment the app leaves the screen — with no error, so the
+            // recorder happily encodes zeros for the rest of the session (AMA-393). Deliberately
+            // fail-open: if the service cannot start we still record, because capture on screen
+            // beats no capture at all, and the reason is reported at stop.
+            //
+            // The visibility check has to happen BEFORE the start: the capability is decided at
+            // that instant, and a service started from the background never gets it.
+            boolean visibleAtStart = RecordingForegroundService.isAppVisible(getContext());
+            micServiceError = RecordingForegroundService.start(getContext());
+            micServiceStarted = micServiceError == null;
+            micCapabilityGranted = micServiceStarted && visibleAtStart;
+            if (!micCapabilityGranted) {
+                android.util.Log.w(
+                    "VoiceRecorder",
+                    "microphone capability not held (started=" + micServiceStarted +
+                    ", error=" + micServiceError + ", visible=" + visibleAtStart +
+                    ") — this recording can only capture while the app is on screen"
+                );
+            }
             // Forward live-streaming lifecycle events to JS for logging. Set before startRecording
             // so connect/error events emitted during setup are delivered.
             mediaRecorder.setStreamEventListener(event -> notifyListeners("recordingStreamEvent", event));
             mediaRecorder.startRecording();
             isInterrupted = false;
             wasInterruptedAndStopped = false;
-            call.resolve(ResponseGenerator.successResponse());
+            JSObject started = ResponseGenerator.successResponse();
+            // Reported at start as well as at stop: a recording that begins without the service is
+            // already doomed to lose everything off screen, and waiting hours for the stop log to
+            // say so is how this went unnoticed in the first place.
+            started.put("micForegroundService", micServiceStarted);
+            started.put("micCapability", micCapabilityGranted);
+            if (micServiceError != null) {
+                started.put("micForegroundServiceError", micServiceError);
+            }
+            call.resolve(started);
         } catch (Exception exp) {
             mediaRecorder = null;
+            RecordingForegroundService.stop(getContext());
+            micServiceStarted = false;
+            micCapabilityGranted = false;
             releaseAudioFocus();
             JSObject details = new JSObject();
             details.put("exceptionType", exp.getClass().getSimpleName());
@@ -216,6 +267,17 @@ public class VoiceRecorder extends Plugin {
                     mediaRecorder.isUnprocessedSupportedOnDevice()
                 );
                 recordData.setPeakAmplitude(mediaRecorder.getPeakAmplitude(), mediaRecorder.isSilent());
+                // The continuous measurement behind that flag, plus whether the microphone
+                // foreground service was actually holding the capability. Together these answer
+                // "did this recording hear anything, and if not, why" from the log alone.
+                recordData.setCaptureStats(
+                    mediaRecorder.getCaptureRatio(),
+                    mediaRecorder.getMutedRatio(),
+                    mediaRecorder.getLongestMutedMs(),
+                    mediaRecorder.getCaptureSamples(),
+                    mediaRecorder.getSilenceReason()
+                );
+                recordData.setMicForegroundService(micServiceStarted, micCapabilityGranted, micServiceError);
             } catch (Exception ignored) {}
 
             if ((recordDataBase64 == null && path == null) || recordData.getMsDuration() < 0) {
@@ -232,8 +294,15 @@ public class VoiceRecorder extends Plugin {
             }
 
             mediaRecorder = null;
+            // Release the microphone capability with the recorder. Leaving the service up would
+            // keep an "app is recording" notification and the mic indicator on screen for a
+            // recording that no longer exists.
+            RecordingForegroundService.stop(getContext());
+            micServiceStarted = false;
+            micCapabilityGranted = false;
+            micServiceError = null;
             releaseAudioFocus();
-            
+
             // If we were interrupted, mark that we stopped due to interruption
             if (isInterrupted) {
                 wasInterruptedAndStopped = true;
@@ -488,6 +557,12 @@ public class VoiceRecorder extends Plugin {
             }
             mediaRecorder = null;
         }
+        // Unconditional: the service outlives the Bridge unless something stops it, and an
+        // orphaned foreground service holds the microphone for a recording nobody owns.
+        RecordingForegroundService.stop(getContext());
+        micServiceStarted = false;
+        micCapabilityGranted = false;
+        micServiceError = null;
         releaseGlobalAudioFocusListener();
         super.handleOnDestroy();
     }

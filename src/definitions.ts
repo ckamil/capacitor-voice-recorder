@@ -137,6 +137,13 @@ export type RecordingOptions =
        * Default 200.
        */
       androidSilenceThreshold?: number;
+      /**
+       * Android only. Share of the recording (0..1) that must carry audible signal before it counts
+       * as real audio. Below it the stop diagnostics report `silent` with reason `no_capture` —
+       * the shape a recording has when the platform muted the microphone for everything but the
+       * moments the app was on screen. Observability only. Default 0.02.
+       */
+      androidMinCaptureRatio?: number;
       // When true, ambiguous audio-session interruptions (no reason / unknown reason /
       // iOS < 14.5) let the recording CONTINUE (relying on the native engine auto-restart)
       // instead of stopping. Default false. Drive from SettingsService for remote control.

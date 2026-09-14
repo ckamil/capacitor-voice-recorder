@@ -37,6 +37,9 @@ public class CustomMediaRecorder {
     // Peak PCM amplitude (0..32767) seen across the whole recording, sampled off-thread via
     // MediaRecorder.getMaxAmplitude(). -1 means "never sampled" — distinct from 0 ("dead mic").
     private volatile int peakAmplitude = -1;
+    // Everything the same sampler saw, not just its maximum. A peak cannot tell 20 seconds of
+    // speech followed by 4 hours of zeros from a healthy recording; this can. See CaptureStats.
+    private final CaptureStats captureStats;
     private volatile boolean amplitudeMonitorRunning;
     private Thread amplitudeMonitorThread;
     // Guards every MediaRecorder call that can race the monitor thread against stop()/release().
@@ -47,6 +50,7 @@ public class CustomMediaRecorder {
         android.util.Log.d("CustomMediaRecorder", "Constructor called");
         this.context = context;
         this.options = options;
+        this.captureStats = new CaptureStats(options.getSilenceThreshold(), AMPLITUDE_SAMPLE_INTERVAL_MS);
         generateMediaRecorder();
     }
 
@@ -232,6 +236,13 @@ public class CustomMediaRecorder {
     /** Default peak-amplitude floor (0..32767) under which a recording is flagged as silent. */
     public static final int DEFAULT_SILENCE_THRESHOLD = 200;
 
+    /**
+     * Default share of a recording that must carry audible signal before it counts as real audio.
+     * At 0.02 the AMA-393 recording (20 s of speech in 4 h 29 m, ratio ~0.004) is flagged, while a
+     * genuinely quiet meeting — where somebody speaks for a couple of minutes an hour — is not.
+     */
+    public static final double DEFAULT_MIN_CAPTURE_RATIO = 0.02d;
+
     /** How often the amplitude monitor samples the encoder input. */
     private static final long AMPLITUDE_SAMPLE_INTERVAL_MS = 250L;
 
@@ -320,20 +331,50 @@ public class CustomMediaRecorder {
     }
 
     /**
-     * True when the capture never rose above the silence floor. Null-ish state (never sampled)
-     * reports false — an unsampled recording is "unknown", not "proven silent".
+     * True when the recording holds no usable audio — either the level never left the floor
+     * anywhere (an ungained capture path, AMA-338), or the microphone delivered nothing for all
+     * but a sliver of the recording (the platform muting us off screen, AMA-393).
+     *
+     * A never-sampled recording reports false: "unknown", not "proven silent".
      */
     public boolean isSilent() {
-        return peakAmplitude >= 0 && peakAmplitude < options.getSilenceThreshold();
+        return getSilenceReason() != null;
+    }
+
+    /** Which of the two silent-capture shapes this recording has: below_threshold / no_capture / null. */
+    public String getSilenceReason() {
+        return captureStats.getSilenceReason(peakAmplitude, options.getMinCaptureRatio());
+    }
+
+    /** Share of the recording that carried audible signal, 0..1; -1 when never sampled. */
+    public double getCaptureRatio() {
+        return captureStats.getCaptureRatio();
+    }
+
+    /** Share of the recording where the microphone returned exact zeros, 0..1; -1 when unsampled. */
+    public double getMutedRatio() {
+        return captureStats.getMutedRatio();
+    }
+
+    /** Longest uninterrupted stretch of digital silence, in ms; -1 when unsampled. */
+    public long getLongestMutedMs() {
+        return captureStats.getLongestMutedMs();
+    }
+
+    /** How many level samples the recording is judged on. */
+    public int getCaptureSamples() {
+        return captureStats.getSamples();
     }
 
     // ---------------------------------------------------------------------------------------
     // Amplitude monitor
     //
     // Pure observability: samples MediaRecorder.getMaxAmplitude() (the PCM level going INTO the
-    // encoder) and keeps the running peak. It never touches the recording itself, so a failure
-    // here can only cost the diagnostic, never the audio. This is the check whose absence let a
-    // silent-capture regression run for two months behind passing file-size validation.
+    // encoder) and feeds every reading to CaptureStats, keeping the running peak alongside it.
+    // It never touches the recording itself, so a failure here can only cost the diagnostic, never
+    // the audio. This is the check whose absence let a silent-capture regression run for two months
+    // behind passing file-size validation — and whose peak-only form then let AMA-393 through as
+    // healthy for a recording that was 99.7% digital silence.
     // ---------------------------------------------------------------------------------------
 
     private void startAmplitudeMonitor() {
@@ -360,6 +401,7 @@ public class CustomMediaRecorder {
                             if (amplitude > peakAmplitude) {
                                 peakAmplitude = amplitude;
                             }
+                            captureStats.add(amplitude);
                         } catch (Exception e) {
                             // Paused/stopped/released underneath us — stop sampling, keep the peak.
                             return;

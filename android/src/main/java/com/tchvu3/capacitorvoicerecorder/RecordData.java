@@ -51,6 +51,12 @@ public class RecordData {
     private Boolean unprocessedSupported;
     private Integer peakAmplitude;
     private Boolean silent;
+    private String silenceReason;
+    private Double captureRatio;
+    private Double mutedRatio;
+    private Long longestMutedMs;
+    private Integer captureSamples;
+    private JSObject micForegroundService;
 
     public void setFileSize(long fileSize) {
         this.fileSize = fileSize;
@@ -87,6 +93,53 @@ public class RecordData {
         }
     }
 
+    /**
+     * The continuous measurement behind `silent`. A peak alone cannot tell a healthy recording from
+     * one that captured 20 seconds and then nothing for four hours — these fields can, and they say
+     * which of the two silent-capture shapes it is (`below_threshold` vs `no_capture`).
+     *
+     * Ratios are -1 when the recording was never sampled; those are dropped rather than reported as
+     * zero, because "unknown" and "captured nothing" are different states.
+     */
+    public void setCaptureStats(double captureRatio, double mutedRatio, long longestMutedMs, int samples, String silenceReason) {
+        if (samples > 0) {
+            this.captureSamples = samples;
+        }
+        if (captureRatio >= 0d) {
+            this.captureRatio = captureRatio;
+        }
+        if (mutedRatio >= 0d) {
+            this.mutedRatio = mutedRatio;
+        }
+        if (longestMutedMs >= 0L) {
+            this.longestMutedMs = longestMutedMs;
+        }
+        this.silenceReason = silenceReason;
+    }
+
+    /**
+     * Whether this recording actually held the microphone while off screen.
+     *
+     * Two fields rather than one, because they fail apart: `started` says the foreground service
+     * came up, `capability` says the platform gave that service the microphone. A service started
+     * while the app was in the background reports `started:true, capability:false` — it runs, it
+     * logs nothing, and the recording is still digital silence off screen. That is the AMA-393
+     * condition, and it belongs in the logs rather than being inferred from the audio months later.
+     */
+    public void setMicForegroundService(boolean started, boolean capability, String error) {
+        JSObject info = new JSObject();
+        info.put("started", started);
+        // `started` without `capability` is the case worth reading carefully: the service is up,
+        // but it was started while the app was in the background, and the platform hands the
+        // microphone only to a service started on screen. That recording will be silent off screen
+        // however healthy the service looks.
+        info.put("capability", capability);
+        if (error != null) {
+            info.put("error", error);
+        }
+        this.micForegroundService = info;
+    }
+
     public JSObject toJSObject() {
         JSObject toReturn = new JSObject();
         toReturn.put("recordDataBase64", recordDataBase64);
@@ -117,6 +170,24 @@ public class RecordData {
         if (peakAmplitude != null) {
             diagnostics.put("peakAmplitude", (int) peakAmplitude);
             diagnostics.put("silent", (boolean) silent);
+        }
+        if (captureSamples != null) {
+            diagnostics.put("captureSamples", (int) captureSamples);
+        }
+        if (captureRatio != null) {
+            diagnostics.put("captureRatio", (double) captureRatio);
+        }
+        if (mutedRatio != null) {
+            diagnostics.put("mutedRatio", (double) mutedRatio);
+        }
+        if (longestMutedMs != null) {
+            diagnostics.put("longestMutedMs", (long) longestMutedMs);
+        }
+        if (silenceReason != null) {
+            diagnostics.put("silenceReason", silenceReason);
+        }
+        if (micForegroundService != null) {
+            diagnostics.put("micForegroundService", micForegroundService);
         }
         toReturn.put("diagnostics", diagnostics);
 

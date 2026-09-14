@@ -2,4 +2,22 @@
     <!-- Required for the optional live audio streaming (WebSocket). No effect when streaming is unused. -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      RECORD_AUDIO is a while-in-use permission: from Android 11 the microphone keeps feeding the
+      recorder only while the app has a visible activity OR runs a foreground service of type
+      `microphone`. Without this service the platform silently substitutes digital zeros the moment
+      the app leaves the screen (AMA-393). FOREGROUND_SERVICE_MICROPHONE is mandatory from
+      Android 14 — without it startForeground() throws for this type.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
+    <application>
+        <service
+            android:name="com.tchvu3.capacitorvoicerecorder.RecordingForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="microphone"
+            android:stopWithTask="true" />
+    </application>
 </manifest>
