@@ -10,7 +10,9 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.ServiceCompat;
 import androidx.core.content.ContextCompat;
@@ -30,7 +32,8 @@ import java.util.concurrent.TimeUnit;
  *
  * This service is therefore not observability and not an optimisation — it is the only mechanism
  * the platform offers for the thing the recording feature exists to do. It carries no logic of its
- * own: it starts, shows the mandatory notification, and lives exactly as long as the recording.
+ * own: it starts, shows the mandatory notification, and lives as long as the recording — plus, when
+ * one recording is cut straight into the next, the short hold described at {@link #stopAfter}.
  *
  * Fail-open: {@link #start(Context)} returns a reason string instead of throwing, and the caller
  * records anyway. A recording that captures only while the app is on screen is bad; refusing to
@@ -49,9 +52,25 @@ public class RecordingForegroundService extends Service {
      */
     private static final long START_TIMEOUT_MS = 3000L;
 
+    /**
+     * Upper bound for {@link #stopAfter}, whatever the caller asks for. During a hold the "Recording
+     * in progress" notification is up with nothing recording, so it has to stay short.
+     */
+    private static final long MAX_HOLD_MS = 120000L;
+
     private static volatile CountDownLatch startLatch;
     private static volatile boolean foregroundActive;
     private static volatile String lastError;
+
+    private static final Handler MAIN = new Handler(Looper.getMainLooper());
+    private static final Object HOLD_LOCK = new Object();
+    // Guarded by HOLD_LOCK. The generation invalidates a delayed stop that was already posted when
+    // the next recording takes the service over.
+    private static boolean holdPending;
+    private static long holdGeneration;
+    // Whether the running service was started while the app was on screen and so holds the
+    // microphone capability. A recording that reuses the service inherits it.
+    private static volatile boolean capabilityHeld;
 
     /**
      * Starts the service and blocks until it is in the foreground.
@@ -128,15 +147,71 @@ public class RecordingForegroundService extends Service {
     }
 
     static void stop(Context context) {
+        synchronized (HOLD_LOCK) {
+            holdPending = false;
+            holdGeneration++;
+            stopLocked(context);
+        }
+    }
+
+    private static void stopLocked(Context context) {
         try {
             context.stopService(new Intent(context, RecordingForegroundService.class));
         } catch (Exception e) {
             android.util.Log.w(TAG, "stopService failed: " + e.getMessage());
         }
         foregroundActive = false;
+        capabilityHeld = false;
     }
 
-    /** Whether the microphone capability is currently held by this service. */
+    /**
+     * Stops the service after {@code holdMs} unless {@link #cancelPendingStop()} comes first.
+     *
+     * A promoter cut is a stop followed at once by the next start. Stopping the service in between
+     * hands the microphone capability back, and the start that follows cannot take it again if the
+     * app has left the screen in the meantime — which is exactly what happens when the resource that
+     * caused the cut opens in another app. The next recording then encodes silence from its first
+     * seconds. Holding the service across the gap lets that start reuse it instead.
+     */
+    static void stopAfter(Context context, long holdMs) {
+        final Context appContext = context.getApplicationContext();
+        final long generation;
+        synchronized (HOLD_LOCK) {
+            holdPending = true;
+            generation = ++holdGeneration;
+        }
+        MAIN.postDelayed(() -> {
+            // Checked and stopped under the lock, so a start cannot take the service over between
+            // the check and the stop.
+            synchronized (HOLD_LOCK) {
+                if (!holdPending || holdGeneration != generation) {
+                    return;
+                }
+                holdPending = false;
+                stopLocked(appContext);
+            }
+        }, Math.max(0L, Math.min(holdMs, MAX_HOLD_MS)));
+    }
+
+    /** Cancels a pending {@link #stopAfter}; the service, if still up, now belongs to the caller. */
+    static void cancelPendingStop() {
+        synchronized (HOLD_LOCK) {
+            holdPending = false;
+            holdGeneration++;
+        }
+    }
+
+    /** Records whether the service the caller has just started got the microphone capability. */
+    static void markCapability(boolean held) {
+        capabilityHeld = held;
+    }
+
+    /** Whether the running service holds the microphone capability. */
+    static boolean holdsCapability() {
+        return foregroundActive && capabilityHeld;
+    }
+
+    /** Whether the service is currently in the foreground. */
     static boolean isRunning() {
         return foregroundActive;
     }
@@ -176,6 +251,7 @@ public class RecordingForegroundService extends Service {
     @Override
     public void onDestroy() {
         foregroundActive = false;
+        capabilityHeld = false;
         super.onDestroy();
     }
 

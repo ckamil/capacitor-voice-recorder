@@ -18,6 +18,17 @@ export interface StartRecordingResponse {
   engineFallback?: EngineFallbackDetails | null;
 }
 
+export interface StopRecordingOptions {
+  /**
+   * Android only; ignored on iOS and web. Keeps the microphone foreground service up for this many
+   * milliseconds after the recording stops, for a cut that starts the next recording straight away.
+   * That start reuses the service and the microphone capability it was granted on screen, which a
+   * fresh start after the app has left the screen would be refused. If no start comes in time, the
+   * service stops. Capped natively at 120000. Omit or 0 to release the service at once.
+   */
+  holdMicServiceMs?: number;
+}
+
 export interface RecordingData {
   value: {
     recordDataBase64?: Base64String;
@@ -276,7 +287,7 @@ export interface VoiceRecorderPlugin {
 
   startRecording(options?: RecordingOptions): Promise<StartRecordingResponse>;
 
-  stopRecording(): Promise<RecordingData>;
+  stopRecording(options?: StopRecordingOptions): Promise<RecordingData>;
 
   pauseRecording(): Promise<GenericResponse>;
 

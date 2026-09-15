@@ -8,6 +8,7 @@ import type {
   RecordingData,
   RecordingOptions,
   StartRecordingResponse,
+  StopRecordingOptions,
   VoiceRecorderPlugin,
   MicrophoneAvailabilityEvent,
   MicrophoneBusyResponse,
@@ -36,7 +37,8 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
     return { ...result, engineFallback: null };
   }
 
-  public stopRecording(): Promise<RecordingData> {
+  // The options only concern Android's microphone foreground service.
+  public stopRecording(_options?: StopRecordingOptions): Promise<RecordingData> {
     return this.voiceRecorderInstance.stopRecording();
   }
 

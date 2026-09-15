@@ -49,6 +49,9 @@ public class VoiceRecorder extends Plugin {
     // flags are false and `micServiceError` carries the class name, reported as
     // mic_foreground_service_error.
     private boolean micCapabilityGranted;
+    // Whether this recording took over the service kept up by the previous one (a cut), instead of
+    // starting its own. The capability then comes from that earlier, on-screen start.
+    private boolean micServiceReused;
 
     @PluginMethod
     public void canDeviceVoiceRecord(PluginCall call) {
@@ -163,15 +166,29 @@ public class VoiceRecorder extends Plugin {
             //
             // The visibility check has to happen BEFORE the start: the capability is decided at
             // that instant, and a service started from the background never gets it.
+            //
+            // A cut (stopRecording with holdMicServiceMs) leaves the service up for this start. It is
+            // taken over as it is, with the capability it got on screen: the resource that caused the
+            // cut has often covered the app by now, and a fresh start from there would be refused.
+            RecordingForegroundService.cancelPendingStop();
             boolean visibleAtStart = RecordingForegroundService.isAppVisible(getContext());
-            micServiceError = RecordingForegroundService.start(getContext());
-            micServiceStarted = micServiceError == null;
-            micCapabilityGranted = micServiceStarted && visibleAtStart;
+            micServiceReused = RecordingForegroundService.isRunning();
+            if (micServiceReused) {
+                micServiceError = null;
+                micServiceStarted = true;
+                micCapabilityGranted = RecordingForegroundService.holdsCapability();
+            } else {
+                micServiceError = RecordingForegroundService.start(getContext());
+                micServiceStarted = micServiceError == null;
+                micCapabilityGranted = micServiceStarted && visibleAtStart;
+                RecordingForegroundService.markCapability(micCapabilityGranted);
+            }
             if (!micCapabilityGranted) {
                 android.util.Log.w(
                     "VoiceRecorder",
                     "microphone capability not held (started=" + micServiceStarted +
-                    ", error=" + micServiceError + ", visible=" + visibleAtStart +
+                    ", reused=" + micServiceReused + ", error=" + micServiceError +
+                    ", visible=" + visibleAtStart +
                     ") — this recording can only capture while the app is on screen"
                 );
             }
@@ -187,6 +204,7 @@ public class VoiceRecorder extends Plugin {
             // say so is how this went unnoticed in the first place.
             started.put("micForegroundService", micServiceStarted);
             started.put("micCapability", micCapabilityGranted);
+            started.put("micForegroundServiceReused", micServiceReused);
             if (micServiceError != null) {
                 started.put("micForegroundServiceError", micServiceError);
             }
@@ -196,6 +214,7 @@ public class VoiceRecorder extends Plugin {
             RecordingForegroundService.stop(getContext());
             micServiceStarted = false;
             micCapabilityGranted = false;
+            micServiceReused = false;
             releaseAudioFocus();
             JSObject details = new JSObject();
             details.put("exceptionType", exp.getClass().getSimpleName());
@@ -297,9 +316,19 @@ public class VoiceRecorder extends Plugin {
             // Release the microphone capability with the recorder. Leaving the service up would
             // keep an "app is recording" notification and the mic indicator on screen for a
             // recording that no longer exists.
-            RecordingForegroundService.stop(getContext());
+            //
+            // The one exception is a cut, where the caller starts the next recording straight away
+            // and says so with holdMicServiceMs: the service stays up that long for the next start
+            // to take over (see RecordingForegroundService.stopAfter). If no start comes, it stops.
+            Integer holdMs = call.getInt("holdMicServiceMs", 0);
+            if (holdMs != null && holdMs > 0 && RecordingForegroundService.isRunning()) {
+                RecordingForegroundService.stopAfter(getContext(), holdMs);
+            } else {
+                RecordingForegroundService.stop(getContext());
+            }
             micServiceStarted = false;
             micCapabilityGranted = false;
+            micServiceReused = false;
             micServiceError = null;
             releaseAudioFocus();
 
