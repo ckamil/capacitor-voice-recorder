@@ -14,6 +14,7 @@ import type {
   MicrophoneBusyResponse,
   RecordingInterruptionEvent,
   InterruptionEndedEvent,
+  RecordingAutoStoppedEvent,
   RecordingStreamEvent,
 } from './definitions';
 
@@ -100,7 +101,17 @@ export class VoiceRecorderWeb extends WebPlugin implements VoiceRecorderPlugin {
   ): Promise<PluginListenerHandle> & PluginListenerHandle;
 
   addListener(
-    _eventName: 'microphoneAvailabilityChanged' | 'recordingInterrupted' | 'interruptionEnded' | 'recordingStreamEvent',
+    eventName: 'recordingAutoStopped',
+    listenerFunc: (event: RecordingAutoStoppedEvent) => void,
+  ): Promise<PluginListenerHandle> & PluginListenerHandle;
+
+  addListener(
+    _eventName:
+      | 'microphoneAvailabilityChanged'
+      | 'recordingInterrupted'
+      | 'interruptionEnded'
+      | 'recordingStreamEvent'
+      | 'recordingAutoStopped',
     _listenerFunc: (event: any) => void,
   ): Promise<PluginListenerHandle> & PluginListenerHandle {
     // Create a dummy listener handle for web
