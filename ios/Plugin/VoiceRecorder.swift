@@ -26,8 +26,17 @@ public class VoiceRecorder: CAPPlugin {
             recorderLock.lock()
             defer { recorderLock.unlock() }
             _customMediaRecorder = newValue
+            _isStopping = false
         }
     }
+    // A stop is finalizing `_customMediaRecorder` - from JS or from the length limit. Guarded by
+    // recorderLock, so the device limit, the server's close and a stop from JS, which can all arrive
+    // for the same recording, finalize it once.
+    private var _isStopping = false
+    // Fires autoStop("max_duration") at the recording's maxDurationMs. Guarded by recorderLock.
+    private var _maxDurationTimer: DispatchSourceTimer?
+    /// Stream errors that mean the server cut the live copy at the recording length limit.
+    private static let serverLengthCaps: Set<String> = ["server_max_duration", "server_max_bytes"]
     // Held for the whole duration of an active recording so iOS treats the app as doing
     // important work and is less likely to suspend it in the background. The `audio`
     // background mode is the primary keep-alive; this is a belt-and-suspenders that also
@@ -112,6 +121,8 @@ public class VoiceRecorder: CAPPlugin {
         let subDirectory: String? = call.getString("subDirectory")
         self.continueOnAmbiguousInterruption = call.getBool("continueOnAmbiguousInterruption") ?? false
         let streamingOptions = parseStreamingOptions(call)
+        // 0 or absent keeps the old behaviour: no limit.
+        let maxDurationMs = (call.options["maxDurationMs"] as? NSNumber)?.intValue ?? 0
 
         // Heavy work (audio session activation, Thread.sleep retries) runs off main thread
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -151,8 +162,19 @@ public class VoiceRecorder: CAPPlugin {
             let engineRecorder = AudioEngineRecorder()
             // Forward live-streaming lifecycle events to the JS layer for logging. Set before
             // startRecording so connect/error events emitted during setup are delivered.
-            engineRecorder.onStreamEvent = { [weak self] event in
+            engineRecorder.onStreamEvent = { [weak self, weak engineRecorder] event in
                 self?.notifyListeners("recordingStreamEvent", data: event)
+                // The server cut the live copy at the length limit. The device limit is the same
+                // setting and normally fires first; this covers a clock that drifted or a limit
+                // changed on the server mid-recording. Off the sink's queue: the stop finishes the sink.
+                if event["type"] as? String == "error",
+                   let reason = event["reason"] as? String,
+                   VoiceRecorder.serverLengthCaps.contains(reason),
+                   let recorder = engineRecorder {
+                    DispatchQueue.global(qos: .userInitiated).async {
+                        self?.autoStop(reason, recorder: recorder)
+                    }
+                }
             }
             // If the engine cannot be restarted after a configuration change caused by the screen
             // being captured (ReplayKit screen-share), finalize the partial recording via JS.
@@ -164,6 +186,7 @@ public class VoiceRecorder: CAPPlugin {
             if engineResult.success {
                 self.customMediaRecorder = engineRecorder
                 NSLog("VoiceRecorder: Recording started with AudioEngineRecorder")
+                self.startMaxDurationTimer(maxDurationMs, recorder: engineRecorder)
                 self.beginRecordingBackgroundTask()
                 self.isInterrupted = false
                 self.wasInterruptedAndStopped = false
@@ -207,6 +230,7 @@ public class VoiceRecorder: CAPPlugin {
             if recordingResult.success {
                 self.customMediaRecorder = legacyRecorder
                 NSLog("VoiceRecorder: Recording started with CustomMediaRecorder (fallback)")
+                self.startMaxDurationTimer(maxDurationMs, recorder: legacyRecorder)
                 self.beginRecordingBackgroundTask()
                 self.isInterrupted = false
                 self.wasInterruptedAndStopped = false
@@ -273,10 +297,73 @@ public class VoiceRecorder: CAPPlugin {
     }
 
     @objc func stopRecording(_ call: CAPPluginCall) {
-        guard let recorder = customMediaRecorder else {
+        guard let recorder = claimRecorderForStop() else {
             call.reject(Messages.RECORDING_HAS_NOT_STARTED)
             return
         }
+
+        finishRecording(recorder) { data, rejectMessage in
+            if let data = data {
+                call.resolve(ResponseGenerator.dataResponse(data))
+            } else {
+                call.reject(rejectMessage)
+            }
+        }
+    }
+
+    /// Stop the recording without being asked, because it reached its length limit: the device's
+    /// own (maxDurationMs, `max_duration`) or the server's ("close" on the live stream,
+    /// `server_max_duration` / `server_max_bytes`).
+    ///
+    /// It ends through finishRecording(), so the file, the audio session and the diagnostics come out
+    /// exactly as for a stop from JS. JS hears about it through recordingAutoStopped when it is
+    /// running, and its own stopRecording() then finds no recorder and takes the "already stopped"
+    /// path. When JS is not running, the file is simply there, closed at the limit, for the app to
+    /// attach on its next start.
+    ///
+    /// - Parameter recorder: the recording the limit belongs to; a limit that fires after that
+    ///   recording ended never stops the next one.
+    private func autoStop(_ reason: String, recorder: RecorderInterface) {
+        guard let recorder = claimRecorderForStop(recorder) else {
+            return
+        }
+
+        NSLog("VoiceRecorder: autoStop reason=%@", reason)
+        finishRecording(recorder) { [weak self] data, rejectMessage in
+            var event: [String: Any] = ["reason": reason]
+            if let data = data {
+                event["value"] = data
+            } else {
+                event["error"] = rejectMessage
+            }
+            self?.notifyListeners("recordingAutoStopped", data: event)
+        }
+    }
+
+    /// Take the active recorder for a stop, or nil when there is none or another stop already has it.
+    ///
+    /// - Parameter expected: when given, only that recorder may be taken
+    private func claimRecorderForStop(_ expected: RecorderInterface? = nil) -> RecorderInterface? {
+        recorderLock.lock()
+        defer { recorderLock.unlock() }
+
+        guard let recorder = _customMediaRecorder, !_isStopping else {
+            return nil
+        }
+        if let expected = expected, expected !== recorder {
+            return nil
+        }
+        _isStopping = true
+        return recorder
+    }
+
+    /// Stop the recorder, build what it recorded and restore the audio session. Shared by
+    /// stopRecording() and autoStop() so neither can drift from the other.
+    ///
+    /// - Parameter completion: runs on a background queue with the recording (the `value` of a
+    ///   stopRecording() result), or with nil and the message to reject with
+    private func finishRecording(_ recorder: RecorderInterface, completion: @escaping ([String: Any]?, String) -> Void) {
+        cancelMaxDurationTimer()
 
         // Recording is ending — release the long-lived recording background task. The
         // separate stop background task below covers the finalize/flush window.
@@ -308,7 +395,7 @@ public class VoiceRecorder: CAPPlugin {
 
             guard let self = self else {
                 NSLog("VoiceRecorder: stopRecording [ERR] self is nil")
-                call.reject(Messages.FAILED_TO_FETCH_RECORDING)
+                completion(nil, Messages.FAILED_TO_FETCH_RECORDING)
                 return
             }
 
@@ -321,7 +408,7 @@ public class VoiceRecorder: CAPPlugin {
                 NSLog("VoiceRecorder: Recording file does not exist at expected path: %@",
                       recorder.getOutputFile()?.path ?? "nil")
                 self.customMediaRecorder = nil
-                call.reject(Messages.FAILED_TO_FETCH_RECORDING)
+                completion(nil, Messages.FAILED_TO_FETCH_RECORDING)
                 return
             }
             NSLog("VoiceRecorder: stopRecording [4] outputFile=%@", audioFileUrl.path)
@@ -409,10 +496,10 @@ public class VoiceRecorder: CAPPlugin {
             self.isInterrupted = false
             if (sendDataAsBase64 && recordData.recordDataBase64 == nil) || recordData.msDuration < 0 {
                 NSLog("VoiceRecorder: stopRecording [9] rejecting - empty recording")
-                call.reject(Messages.EMPTY_RECORDING)
+                completion(nil, Messages.EMPTY_RECORDING)
             } else {
                 NSLog("VoiceRecorder: stopRecording [9] resolving with data")
-                call.resolve(ResponseGenerator.dataResponse(recordData.toDictionary()))
+                completion(recordData.toDictionary(), "")
                 NSLog("VoiceRecorder: stopRecording [10] resolve done")
             }
         }
@@ -906,6 +993,39 @@ public class VoiceRecorder: CAPPlugin {
         }
     }
 
+    // MARK: - Recording length limit
+
+    /// Arm the recording length limit. A wall-clock deadline, so it counts real time even across a
+    /// device sleep; the `audio` background mode keeps the process, and with it this timer, running
+    /// while the app is off screen and nothing in the WebView runs.
+    private func startMaxDurationTimer(_ maxDurationMs: Int, recorder: RecorderInterface) {
+        cancelMaxDurationTimer()
+        guard maxDurationMs > 0 else {
+            return
+        }
+
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInitiated))
+        timer.schedule(wallDeadline: .now() + .milliseconds(maxDurationMs))
+        timer.setEventHandler { [weak self, weak recorder] in
+            guard let recorder = recorder else { return }
+            self?.autoStop("max_duration", recorder: recorder)
+        }
+
+        recorderLock.lock()
+        _maxDurationTimer = timer
+        recorderLock.unlock()
+        timer.resume()
+        NSLog("VoiceRecorder: length limit armed at %d ms", maxDurationMs)
+    }
+
+    private func cancelMaxDurationTimer() {
+        recorderLock.lock()
+        let timer = _maxDurationTimer
+        _maxDurationTimer = nil
+        recorderLock.unlock()
+        timer?.cancel()
+    }
+
     // MARK: - Recording background task
 
     /// Begin a background task held for the whole recording. UIApplication APIs must run on
@@ -971,6 +1091,7 @@ public class VoiceRecorder: CAPPlugin {
             return
         }
         NSLog("VoiceRecorder: willTerminate with active recording — emergency finalize")
+        cancelMaxDurationTimer()
         // Synchronous on purpose: after willTerminate returns the process is killed, so there
         // is no later opportunity. recorder.stopRecording() drains the write queue and runs
         // ExtAudioFileDispose, which flushes the trailing packet.
