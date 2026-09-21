@@ -155,6 +155,13 @@ export type RecordingOptions =
        * moments the app was on screen. Observability only. Default 0.02.
        */
       androidMinCaptureRatio?: number;
+      /**
+       * iOS and Android. Longest the recording may run, in milliseconds. The plugin stops it itself
+       * when the limit is reached - natively, so it holds with the app in the background or killed,
+       * when nothing in the WebView runs - and reports it with `recordingAutoStopped`. 0 or omitted
+       * means no limit.
+       */
+      maxDurationMs?: number;
       // When true, ambiguous audio-session interruptions (no reason / unknown reason /
       // iOS < 14.5) let the recording CONTINUE (relying on the native engine auto-restart)
       // instead of stopping. Default false. Drive from SettingsService for remote control.
@@ -367,7 +374,25 @@ export interface VoiceRecorderPlugin {
   ): Promise<PluginListenerHandle> & PluginListenerHandle;
 
   /**
+   * iOS and Android. The plugin stopped the recording on its own because it reached its length
+   * limit: `max_duration` for the device's own `maxDurationMs`, `server_max_duration` or
+   * `server_max_bytes` when the server cut the live copy. `value` is the finished recording, as
+   * stopRecording() would have returned it. Delivered only while the app is running; when it is
+   * not, the recording file is left closed at the limit for the app to pick up on its next start.
+   */
+  addListener(
+    eventName: 'recordingAutoStopped',
+    listenerFunc: (event: RecordingAutoStoppedEvent) => void,
+  ): Promise<PluginListenerHandle> & PluginListenerHandle;
+
+  /**
    * Remove all listeners for this plugin
    */
   removeAllListeners(): Promise<void>;
+}
+
+export interface RecordingAutoStoppedEvent {
+  reason: 'max_duration' | 'server_max_duration' | 'server_max_bytes' | string;
+  value?: RecordingData['value'];
+  error?: string;
 }

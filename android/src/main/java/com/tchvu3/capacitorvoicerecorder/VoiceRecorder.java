@@ -27,6 +27,10 @@ import java.io.IOException;
 )
 public class VoiceRecorder extends Plugin {
 
+    /** Stream errors that mean the server cut the live copy at the recording length limit. */
+    private static final java.util.Set<String> SERVER_LENGTH_CAPS =
+        new java.util.HashSet<>(java.util.Arrays.asList("server_max_duration", "server_max_bytes"));
+
     static final String RECORD_AUDIO_ALIAS = "voice recording";
     private CustomMediaRecorder mediaRecorder;
     private AudioManager audioManager;
@@ -155,7 +159,14 @@ public class VoiceRecorder extends Plugin {
             if (minCaptureRatio != null) {
                 options.setMinCaptureRatio(minCaptureRatio);
             }
+            Integer maxDurationMs = call.getInt("maxDurationMs", 0);
+            if (maxDurationMs != null) {
+                options.setMaxDurationMs(maxDurationMs);
+            }
             mediaRecorder = new CustomMediaRecorder(getContext(), options);
+            // MediaRecorder reports its limit on its own thread; the stop runs on the plugin's call
+            // thread so it can never interleave with a stopRecording() coming from JS.
+            mediaRecorder.setOnMaxDurationReached(() -> getBridge().execute(() -> autoStop("max_duration")));
 
             // Take the microphone foreground service BEFORE opening the recorder. RECORD_AUDIO is a
             // while-in-use permission: without a service of type `microphone` the platform stops
@@ -194,7 +205,16 @@ public class VoiceRecorder extends Plugin {
             }
             // Forward live-streaming lifecycle events to JS for logging. Set before startRecording
             // so connect/error events emitted during setup are delivered.
-            mediaRecorder.setStreamEventListener(event -> notifyListeners("recordingStreamEvent", event));
+            mediaRecorder.setStreamEventListener(event -> {
+                notifyListeners("recordingStreamEvent", event);
+                // The server cut the live copy at the length limit. The device limit is the same
+                // setting and normally fires first; this covers a clock that drifted or a limit
+                // changed on the server mid-recording.
+                String reason = event.getString("reason");
+                if ("error".equals(event.getString("type")) && SERVER_LENGTH_CAPS.contains(reason)) {
+                    getBridge().execute(() -> autoStop(reason));
+                }
+            });
             mediaRecorder.startRecording();
             isInterrupted = false;
             wasInterruptedAndStopped = false;
@@ -231,6 +251,54 @@ public class VoiceRecorder extends Plugin {
             return;
         }
 
+        try {
+            RecordData recordData = finishRecording(call.getInt("holdMicServiceMs", 0));
+            if (recordData == null) {
+                call.reject(Messages.EMPTY_RECORDING);
+            } else {
+                call.resolve(ResponseGenerator.dataResponse(recordData.toJSObject()));
+            }
+        } catch (Exception exp) {
+            call.reject(Messages.FAILED_TO_FETCH_RECORDING, exp);
+        }
+    }
+
+    /**
+     * Stop the recording without being asked, because it reached its length limit - the device's
+     * own (MediaRecorder.setMaxDuration) or the server's ("close" on the live stream).
+     *
+     * It ends through finishRecording(), so the file, the microphone service and the diagnostics
+     * come out exactly as for a stop from JS. JS hears about it through recordingAutoStopped when it
+     * is running. When it is not - the app in the background or gone - the file is simply there,
+     * closed at the limit, and the app attaches it on its next start with the file's last write as
+     * the stop time instead of the moment it was reopened.
+     */
+    private void autoStop(String reason) {
+        if (mediaRecorder == null) {
+            return; // already stopped: the device limit and the server's close can both arrive
+        }
+
+        JSObject event = new JSObject();
+        event.put("reason", reason);
+        try {
+            RecordData recordData = finishRecording(0);
+            if (recordData != null) {
+                event.put("value", recordData.toJSObject());
+            }
+        } catch (Exception exp) {
+            event.put("error", exp.getMessage());
+        }
+        notifyListeners("recordingAutoStopped", event);
+    }
+
+    /**
+     * Stop the recorder, build what it recorded and release the microphone. Shared by stopRecording()
+     * and autoStop() so neither can drift from the other.
+     *
+     * @param holdMs keep the microphone service up this long for an immediate next start (a cut)
+     * @return the recording, or null when it came out empty
+     */
+    private RecordData finishRecording(Integer holdMs) throws Exception {
         try {
             mediaRecorder.stopRecording();
             JSObject streamingDiagnostics = mediaRecorder.getStreamingDiagnostics();
@@ -300,12 +368,9 @@ public class VoiceRecorder extends Plugin {
             } catch (Exception ignored) {}
 
             if ((recordDataBase64 == null && path == null) || recordData.getMsDuration() < 0) {
-                call.reject(Messages.EMPTY_RECORDING);
-            } else {
-                call.resolve(ResponseGenerator.dataResponse(recordData.toJSObject()));
+                return null;
             }
-        } catch (Exception exp) {
-            call.reject(Messages.FAILED_TO_FETCH_RECORDING, exp);
+            return recordData;
         } finally {
             RecordOptions options = mediaRecorder.getRecordOptions();
             if (options.getDirectory() == null) {
@@ -320,7 +385,6 @@ public class VoiceRecorder extends Plugin {
             // The one exception is a cut, where the caller starts the next recording straight away
             // and says so with holdMicServiceMs: the service stays up that long for the next start
             // to take over (see RecordingForegroundService.stopAfter). If no start comes, it stops.
-            Integer holdMs = call.getInt("holdMicServiceMs", 0);
             if (holdMs != null && holdMs > 0 && RecordingForegroundService.isRunning()) {
                 RecordingForegroundService.stopAfter(getContext(), holdMs);
             } else {

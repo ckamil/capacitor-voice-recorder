@@ -25,6 +25,7 @@ public class CustomMediaRecorder {
     private AudioStreamSink streamSink;
     private AdtsStreamReader streamReader;
     private AudioStreamSink.EventListener streamEventListener;
+    private Runnable onMaxDurationReached;
     private JSObject streamingDiagnostics;
     private String inputRoute;
 
@@ -81,12 +82,21 @@ public class CustomMediaRecorder {
             mediaRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
             mediaRecorder.setAudioEncodingBitRate(96000);
             mediaRecorder.setAudioSamplingRate(44100);
+            // The length limit is enforced by the platform, not by a timer in JS: a recording is
+            // at its longest exactly when the app is in the background or gone, and nothing in the
+            // WebView runs then. MediaRecorder stops itself at the limit and says so below.
+            if (options.getMaxDurationMs() > 0) {
+                mediaRecorder.setMaxDuration(options.getMaxDurationMs());
+            }
 
             mediaRecorder.setOnErrorListener((mr, what, extra) -> {
                 android.util.Log.e("CustomMediaRecorder", "MediaRecorder error: what=" + what + " extra=" + extra);
             });
             mediaRecorder.setOnInfoListener((mr, what, extra) -> {
                 android.util.Log.d("CustomMediaRecorder", "MediaRecorder info: what=" + what + " extra=" + extra);
+                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED && onMaxDurationReached != null) {
+                    onMaxDurationReached.run();
+                }
             });
 
             android.util.Log.d("CustomMediaRecorder", "MediaRecorder configured, setting output file");
@@ -428,6 +438,11 @@ public class CustomMediaRecorder {
             // bails out on the first check, so this is a formality.
             thread.join(500);
         } catch (Exception ignored) {}
+    }
+
+    /** Called once MediaRecorder has stopped itself at RecordOptions.getMaxDurationMs(). */
+    public void setOnMaxDurationReached(Runnable listener) {
+        this.onMaxDurationReached = listener;
     }
 
     public void setStreamEventListener(AudioStreamSink.EventListener listener) {

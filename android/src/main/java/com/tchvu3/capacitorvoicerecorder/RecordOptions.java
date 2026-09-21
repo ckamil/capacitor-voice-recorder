@@ -8,6 +8,7 @@ public class RecordOptions {
     private String audioSource;
     private int silenceThreshold = CustomMediaRecorder.DEFAULT_SILENCE_THRESHOLD;
     private double minCaptureRatio = CustomMediaRecorder.DEFAULT_MIN_CAPTURE_RATIO;
+    private int maxDurationMs = 0;
 
     public RecordOptions(String directory, String subDirectory) {
         this.directory = directory;
@@ -58,6 +59,15 @@ public class RecordOptions {
         if (minCaptureRatio >= 0d && minCaptureRatio <= 1d) {
             this.minCaptureRatio = minCaptureRatio;
         }
+    }
+
+    /** 0 means no limit, which is what every caller that does not send it gets. */
+    public int getMaxDurationMs() {
+        return maxDurationMs;
+    }
+
+    public void setMaxDurationMs(int maxDurationMs) {
+        this.maxDurationMs = Math.max(0, maxDurationMs);
     }
 
     public String getDirectory() {
