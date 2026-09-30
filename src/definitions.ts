@@ -156,6 +156,13 @@ export type RecordingOptions =
        */
       androidMinCaptureRatio?: number;
       /**
+       * Android only. A run of exact zeros this long, in ms, raises `microphoneSilenced` while the
+       * recording is still running, and `microphoneRestored` when sound comes back. A live room
+       * never reads exactly zero, so this is the microphone being taken away (a call, another app,
+       * the microphone switched off in quick settings). 0 turns it off. Default 20000.
+       */
+      androidSilenceAlertMs?: number;
+      /**
        * iOS and Android. Longest the recording may run, in milliseconds. The plugin stops it itself
        * when the limit is reached - natively, so it holds with the app in the background or killed,
        * when nothing in the WebView runs - and reports it with `recordingAutoStopped`. 0 or omitted
@@ -386,9 +393,46 @@ export interface VoiceRecorderPlugin {
   ): Promise<PluginListenerHandle> & PluginListenerHandle;
 
   /**
+   * Android only. The microphone has delivered exact zeros for `androidSilenceAlertMs` while the
+   * recording runs. Once per episode; `microphoneRestored` ends it.
+   */
+  addListener(
+    eventName: 'microphoneSilenced',
+    listenerFunc: (event: MicrophoneSilenceEvent) => void,
+  ): Promise<PluginListenerHandle> & PluginListenerHandle;
+
+  /**
+   * Android only. Sound came back after a `microphoneSilenced` episode; `runMs` is its full length.
+   */
+  addListener(
+    eventName: 'microphoneRestored',
+    listenerFunc: (event: MicrophoneSilenceEvent) => void,
+  ): Promise<PluginListenerHandle> & PluginListenerHandle;
+
+  /**
    * Remove all listeners for this plugin
    */
   removeAllListeners(): Promise<void>;
+}
+
+/**
+ * Android. What the platform lets an app see about who holds the microphone, next to a run of
+ * digital silence. Also reported at stop as `diagnostics.audioEnvironment` (without the first three).
+ */
+export interface MicrophoneSilenceEvent {
+  /** SILENCED: the run length when it was reported. RESTORED: the full length of the run. */
+  runMs: number;
+  /** Whether the app was on screen when the signal fired. */
+  appVisible?: boolean;
+  /** Whether this recording's microphone service held the while-in-use capability. */
+  micCapability?: boolean;
+  /** `AudioManager.getMode()`: 2 = cellular call, 3 = VoIP. */
+  audioMode?: number;
+  audioModeName?: 'normal' | 'ringtone' | 'in_call' | 'in_communication' | 'call_screening' | string;
+  /** Android 10+: the platform says it is feeding this recording silence. Null when unavailable. */
+  clientSilenced?: boolean | null;
+  /** Recording configurations the platform lists to this app. */
+  activeRecordingCount?: number;
 }
 
 export interface RecordingAutoStoppedEvent {

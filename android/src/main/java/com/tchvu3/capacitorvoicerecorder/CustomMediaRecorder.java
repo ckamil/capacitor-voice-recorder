@@ -43,6 +43,12 @@ public class CustomMediaRecorder {
     private final CaptureStats captureStats;
     private volatile boolean amplitudeMonitorRunning;
     private Thread amplitudeMonitorThread;
+    // Told when a run of exact zeros reaches the alert length and when signal comes back, so the
+    // app can say so while the recording is still running instead of hours later at the stop.
+    private volatile SilenceListener silenceListener;
+    // Call / VoIP / other captures at the moment of the stop; read before release(), which ends
+    // the recorder's own recording configuration.
+    private JSObject stopAudioEnvironment;
     // Guards every MediaRecorder call that can race the monitor thread against stop()/release().
     private final Object recorderLock = new Object();
     private volatile boolean recorderReleased;
@@ -51,7 +57,11 @@ public class CustomMediaRecorder {
         android.util.Log.d("CustomMediaRecorder", "Constructor called");
         this.context = context;
         this.options = options;
-        this.captureStats = new CaptureStats(options.getSilenceThreshold(), AMPLITUDE_SAMPLE_INTERVAL_MS);
+        this.captureStats = new CaptureStats(
+            options.getSilenceThreshold(),
+            AMPLITUDE_SAMPLE_INTERVAL_MS,
+            options.getSilenceAlertMs()
+        );
         generateMediaRecorder();
     }
 
@@ -185,6 +195,9 @@ public class CustomMediaRecorder {
                 }
             }
         } catch (Exception ignored) {}
+        // Same reason: a silent file should say whether a call, another app or the system had the
+        // microphone, and the recorder's own configuration is gone once it is released.
+        stopAudioEnvironment = getAudioEnvironment();
         try {
             synchronized (recorderLock) {
                 mediaRecorder.stop();
@@ -255,6 +268,39 @@ public class CustomMediaRecorder {
 
     /** How often the amplitude monitor samples the encoder input. */
     private static final long AMPLITUDE_SAMPLE_INTERVAL_MS = 250L;
+
+    /**
+     * Default length of a run of exact zeros that raises `microphoneSilenced`. A live room never
+     * reads exactly zero, and 20 s rules out a pause, a cough into the hand or a short dropout.
+     */
+    public static final int DEFAULT_SILENCE_ALERT_MS = 20000;
+
+    /** Receives the live silence signal from the amplitude monitor thread. */
+    public interface SilenceListener {
+        void onSilenceSignal(CaptureStats.LiveSignal signal, long runMs);
+    }
+
+    /**
+     * Diagnostics label for AudioManager.getMode(). A call or VoIP session owns the microphone and
+     * every other capture gets exact zeros, so the mode is the first thing to read next to a
+     * silent recording. Pure, like audioSourceName: the constants are compile-time ints.
+     */
+    static String audioModeName(int mode) {
+        switch (mode) {
+            case AudioManager.MODE_NORMAL:
+                return "normal";
+            case AudioManager.MODE_RINGTONE:
+                return "ringtone";
+            case AudioManager.MODE_IN_CALL:
+                return "in_call";
+            case AudioManager.MODE_IN_COMMUNICATION:
+                return "in_communication";
+            case AudioManager.MODE_CALL_SCREENING:
+                return "call_screening";
+            default:
+                return "other_" + mode;
+        }
+    }
 
     /**
      * Maps a requested source token to a MediaRecorder.AudioSource constant.
@@ -376,6 +422,57 @@ public class CustomMediaRecorder {
         return captureStats.getSamples();
     }
 
+    public void setSilenceListener(SilenceListener listener) {
+        this.silenceListener = listener;
+    }
+
+    /** The audio environment read just before the stop; null when it could not be read. */
+    public JSObject getStopAudioEnvironment() {
+        return stopAudioEnvironment;
+    }
+
+    /**
+     * Who else is using audio right now, as far as the platform tells an ordinary app:
+     *
+     * - `audioMode` / `audioModeName`: a call (`in_call`) or a VoIP session (`in_communication`)
+     *   takes the microphone from every other capture;
+     * - `clientSilenced` (Android 10+): the platform itself says it is feeding THIS recording
+     *   silence, because of its concurrent-capture policy; null where the API is missing;
+     * - `activeRecordingCount`: the recording configurations the platform lists to this app.
+     *
+     * Best-effort: every field that cannot be read is left out or null, and nothing here can throw
+     * into the recording.
+     */
+    public JSObject getAudioEnvironment() {
+        JSObject info = new JSObject();
+        try {
+            AudioManager audioManager = (AudioManager) context.getSystemService(Context.AUDIO_SERVICE);
+            if (audioManager != null) {
+                int mode = audioManager.getMode();
+                info.put("audioMode", mode);
+                info.put("audioModeName", audioModeName(mode));
+                java.util.List<android.media.AudioRecordingConfiguration> configs =
+                    audioManager.getActiveRecordingConfigurations();
+                info.put("activeRecordingCount", configs == null ? 0 : configs.size());
+            }
+        } catch (Exception ignored) {}
+        Object silenced = org.json.JSONObject.NULL;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                synchronized (recorderLock) {
+                    if (mediaRecorder != null && !recorderReleased) {
+                        android.media.AudioRecordingConfiguration own = mediaRecorder.getActiveRecordingConfiguration();
+                        if (own != null) {
+                            silenced = own.isClientSilenced();
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {}
+        info.put("clientSilenced", silenced);
+        return info;
+    }
+
     // ---------------------------------------------------------------------------------------
     // Amplitude monitor
     //
@@ -398,6 +495,7 @@ public class CustomMediaRecorder {
                         Thread.currentThread().interrupt();
                         return;
                     }
+                    CaptureStats.LiveSignal signal = CaptureStats.LiveSignal.NONE;
                     synchronized (recorderLock) {
                         if (!amplitudeMonitorRunning || recorderReleased || mediaRecorder == null) {
                             return;
@@ -411,10 +509,22 @@ public class CustomMediaRecorder {
                             if (amplitude > peakAmplitude) {
                                 peakAmplitude = amplitude;
                             }
-                            captureStats.add(amplitude);
+                            signal = captureStats.add(amplitude);
                         } catch (Exception e) {
                             // Paused/stopped/released underneath us — stop sampling, keep the peak.
                             return;
+                        }
+                    }
+                    // Outside the lock: the listener reads the audio environment, which takes the
+                    // lock itself. A paused recorder reads zero by design, so no alert then.
+                    SilenceListener listener = silenceListener;
+                    if (signal != CaptureStats.LiveSignal.NONE
+                        && listener != null
+                        && currentRecordingStatus == CurrentRecordingStatus.RECORDING) {
+                        try {
+                            listener.onSilenceSignal(signal, captureStats.getLastSignalRunMs());
+                        } catch (Exception ignored) {
+                            // The alert is observability; it must never stop the sampler.
                         }
                     }
                 }

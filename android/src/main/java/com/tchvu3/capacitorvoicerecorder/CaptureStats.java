@@ -22,22 +22,50 @@ package com.tchvu3.capacitorvoicerecorder;
  */
 public final class CaptureStats {
 
+    /**
+     * What one reading changed for the live alert. The stop-time numbers arrive hours too late for
+     * a tablet that hands over exact zeros with the app on screen (seen on RS for whole shifts), so
+     * a run of zeros long enough to rule out a pause between words is reported while it happens.
+     */
+    public enum LiveSignal {
+        NONE,
+        /** The current run of exact zeros just reached the alert length. Once per run. */
+        SILENCED,
+        /** Signal came back after a run that had been reported as SILENCED. */
+        RESTORED,
+    }
+
     private final int silenceThreshold;
     private final long sampleIntervalMs;
+    // Length of a run of exact zeros that raises SILENCED, in samples; 0 turns the live alert off.
+    private final int silenceAlertRun;
 
     private int samples;
     private int aboveFloor;
     private int muted;
     private int longestMutedRun;
     private int currentMutedRun;
+    private boolean silenceReported;
+    private int lastSignalRun;
 
     public CaptureStats(int silenceThreshold, long sampleIntervalMs) {
+        this(silenceThreshold, sampleIntervalMs, 0L);
+    }
+
+    /**
+     * @param silenceAlertMs a run of exact zeros this long raises {@link LiveSignal#SILENCED}; 0 or
+     *                       less never does
+     */
+    public CaptureStats(int silenceThreshold, long sampleIntervalMs, long silenceAlertMs) {
         this.silenceThreshold = Math.max(0, silenceThreshold);
         this.sampleIntervalMs = Math.max(1, sampleIntervalMs);
+        this.silenceAlertRun = silenceAlertMs <= 0L
+            ? 0
+            : (int) Math.max(1L, (silenceAlertMs + this.sampleIntervalMs - 1) / this.sampleIntervalMs);
     }
 
     /** Feeds one MediaRecorder.getMaxAmplitude() reading (0..32767). */
-    public synchronized void add(int amplitude) {
+    public synchronized LiveSignal add(int amplitude) {
         int value = Math.max(0, amplitude);
         samples++;
         if (value >= silenceThreshold) {
@@ -49,9 +77,29 @@ public final class CaptureStats {
             if (currentMutedRun > longestMutedRun) {
                 longestMutedRun = currentMutedRun;
             }
-        } else {
-            currentMutedRun = 0;
+            if (silenceAlertRun > 0 && !silenceReported && currentMutedRun >= silenceAlertRun) {
+                silenceReported = true;
+                lastSignalRun = currentMutedRun;
+                return LiveSignal.SILENCED;
+            }
+            return LiveSignal.NONE;
         }
+        int endedRun = currentMutedRun;
+        currentMutedRun = 0;
+        if (silenceReported) {
+            silenceReported = false;
+            lastSignalRun = endedRun;
+            return LiveSignal.RESTORED;
+        }
+        return LiveSignal.NONE;
+    }
+
+    /**
+     * The run behind the last SILENCED (its length when it was reported) or RESTORED (its full
+     * length), in ms.
+     */
+    public synchronized long getLastSignalRunMs() {
+        return lastSignalRun * sampleIntervalMs;
     }
 
     public synchronized int getSamples() {

@@ -167,4 +167,92 @@ public class CaptureStatsTest {
         assertEquals(1d, stats.getCaptureRatio(), 0.0001d);
         assertNull(stats.getSilenceReason(THRESHOLD, MIN_RATIO));
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Live alert: the RS tablets that delivered exact zeros for hours with the app on screen, the
+    // microphone service running and the permission granted. The stop-time numbers only said so
+    // once the recording ended; the live signal says it after ALERT_MS of zeros.
+    // ---------------------------------------------------------------------------------------------
+
+    private static final long ALERT_MS = 20000L;
+    private static final int ALERT_SAMPLES = (int) (ALERT_MS / INTERVAL_MS);
+
+    private static CaptureStats alerting() {
+        return new CaptureStats(THRESHOLD, INTERVAL_MS, ALERT_MS);
+    }
+
+    /** Feeds `samples` readings and counts the non-NONE signals they produced. */
+    private static int signals(CaptureStats stats, int amplitude, int samples, CaptureStats.LiveSignal wanted) {
+        int count = 0;
+        for (int i = 0; i < samples; i++) {
+            if (stats.add(amplitude) == wanted) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    @Test
+    public void aLongRunOfZerosIsReportedOnceWhenItReachesTheAlertLength() {
+        CaptureStats stats = alerting();
+        feed(stats, LOUD, 40);
+
+        assertEquals(0, signals(stats, 0, ALERT_SAMPLES - 1, CaptureStats.LiveSignal.SILENCED));
+        assertEquals(CaptureStats.LiveSignal.SILENCED, stats.add(0));
+        assertEquals(ALERT_MS, stats.getLastSignalRunMs());
+        // An hour more of zeros is the same episode, not another alert.
+        assertEquals(0, signals(stats, 0, 4 * 3600, CaptureStats.LiveSignal.SILENCED));
+    }
+
+    @Test
+    public void signalComingBackEndsTheEpisodeWithItsFullLength() {
+        CaptureStats stats = alerting();
+        feed(stats, 0, ALERT_SAMPLES + 20);
+
+        assertEquals(CaptureStats.LiveSignal.RESTORED, stats.add(LOUD));
+        assertEquals((ALERT_SAMPLES + 20) * INTERVAL_MS, stats.getLastSignalRunMs());
+        // Further speech is not another restore.
+        assertEquals(0, signals(stats, LOUD, 100, CaptureStats.LiveSignal.RESTORED));
+    }
+
+    @Test
+    public void aSecondRunIsASecondEpisode() {
+        CaptureStats stats = alerting();
+        assertEquals(1, signals(stats, 0, ALERT_SAMPLES, CaptureStats.LiveSignal.SILENCED));
+        assertEquals(CaptureStats.LiveSignal.RESTORED, stats.add(LOUD));
+        assertEquals(1, signals(stats, 0, ALERT_SAMPLES, CaptureStats.LiveSignal.SILENCED));
+    }
+
+    @Test
+    public void pausesBetweenWordsNeverAlert() {
+        // A quiet room is not exact zeros, and a short dropout is shorter than the alert length.
+        CaptureStats stats = alerting();
+        for (int i = 0; i < 1000; i++) {
+            assertEquals(CaptureStats.LiveSignal.NONE, stats.add(i % 50 == 0 ? LOUD : 30));
+        }
+        assertEquals(0, signals(stats, 0, ALERT_SAMPLES - 1, CaptureStats.LiveSignal.SILENCED));
+        assertEquals(CaptureStats.LiveSignal.NONE, stats.add(LOUD));
+    }
+
+    @Test
+    public void zeroAlertLengthTurnsTheLiveSignalOff() {
+        CaptureStats stats = new CaptureStats(THRESHOLD, INTERVAL_MS, 0L);
+        assertEquals(0, signals(stats, 0, 10000, CaptureStats.LiveSignal.SILENCED));
+        assertEquals(CaptureStats.LiveSignal.NONE, stats.add(LOUD));
+        // The stop-time measurement is unaffected.
+        assertEquals(10000L * INTERVAL_MS, stats.getLongestMutedMs());
+    }
+
+    @Test
+    public void theTwoArgumentConstructorKeepsTheOldBehaviour() {
+        CaptureStats stats = stats();
+        assertEquals(0, signals(stats, 0, 10000, CaptureStats.LiveSignal.SILENCED));
+    }
+
+    @Test
+    public void anAlertLengthShorterThanOneSampleStillNeedsOneZero() {
+        CaptureStats stats = new CaptureStats(THRESHOLD, INTERVAL_MS, 1L);
+        assertEquals(CaptureStats.LiveSignal.NONE, stats.add(LOUD));
+        assertEquals(CaptureStats.LiveSignal.SILENCED, stats.add(0));
+    }
 }

@@ -57,6 +57,7 @@ public class RecordData {
     private Long longestMutedMs;
     private Integer captureSamples;
     private JSObject micForegroundService;
+    private JSObject audioEnvironment;
 
     public void setFileSize(long fileSize) {
         this.fileSize = fileSize;
@@ -140,6 +141,16 @@ public class RecordData {
         this.micForegroundService = info;
     }
 
+    /**
+     * Who had the microphone when the recording stopped: the audio mode (a call or VoIP session
+     * silences every other capture), whether the platform was feeding this recording silence
+     * (Android 10+), and how many recordings the platform listed. Answers "why is this file
+     * silent" from the log, where the peak and ratios only say THAT it is.
+     */
+    public void setAudioEnvironment(JSObject audioEnvironment) {
+        this.audioEnvironment = audioEnvironment;
+    }
+
     public JSObject toJSObject() {
         JSObject toReturn = new JSObject();
         toReturn.put("recordDataBase64", recordDataBase64);
@@ -188,6 +199,9 @@ public class RecordData {
         }
         if (micForegroundService != null) {
             diagnostics.put("micForegroundService", micForegroundService);
+        }
+        if (audioEnvironment != null) {
+            diagnostics.put("audioEnvironment", audioEnvironment);
         }
         toReturn.put("diagnostics", diagnostics);
 

@@ -163,7 +163,16 @@ public class VoiceRecorder extends Plugin {
             if (maxDurationMs != null) {
                 options.setMaxDurationMs(maxDurationMs);
             }
+            Integer silenceAlertMs = call.getInt("androidSilenceAlertMs", CustomMediaRecorder.DEFAULT_SILENCE_ALERT_MS);
+            if (silenceAlertMs != null) {
+                options.setSilenceAlertMs(silenceAlertMs);
+            }
             mediaRecorder = new CustomMediaRecorder(getContext(), options);
+            // Exact zeros for longer than the alert length, reported while the recording runs. The
+            // RS tablets that recorded whole shifts of digital silence had the app on screen, the
+            // service up and the permission granted: nothing but this could have said so in time.
+            final CustomMediaRecorder recorderForAlerts = mediaRecorder;
+            mediaRecorder.setSilenceListener((signal, runMs) -> notifySilenceSignal(recorderForAlerts, signal, runMs));
             // MediaRecorder reports its limit on its own thread; the stop runs on the plugin's call
             // thread so it can never interleave with a stopRecording() coming from JS.
             mediaRecorder.setOnMaxDurationReached(() -> getBridge().execute(() -> autoStop("max_duration")));
@@ -365,6 +374,9 @@ public class VoiceRecorder extends Plugin {
                     mediaRecorder.getSilenceReason()
                 );
                 recordData.setMicForegroundService(micServiceStarted, micCapabilityGranted, micServiceError);
+            } catch (Exception ignored) {}
+            try {
+                recordData.setAudioEnvironment(mediaRecorder.getStopAudioEnvironment());
             } catch (Exception ignored) {}
 
             if ((recordDataBase64 == null && path == null) || recordData.getMsDuration() < 0) {
@@ -768,6 +780,26 @@ public class VoiceRecorder extends Plugin {
         // If we have an active recording that's not interrupted, we are using the microphone
         // If recording is interrupted, we're not actively using the microphone anymore
         return mediaRecorder != null && !isInterrupted;
+    }
+
+    /**
+     * `microphoneSilenced` / `microphoneRestored` from the amplitude monitor thread. Carries what the
+     * platform lets an app see about who holds the microphone, so the app log can tell a call, another
+     * app and a switched-off microphone apart. Fail-open: an alert that cannot be built is dropped.
+     */
+    private void notifySilenceSignal(CustomMediaRecorder recorder, CaptureStats.LiveSignal signal, long runMs) {
+        try {
+            JSObject event = recorder.getAudioEnvironment();
+            event.put("runMs", runMs);
+            event.put("appVisible", RecordingForegroundService.isAppVisible(getContext()));
+            event.put("micCapability", micCapabilityGranted);
+            notifyListeners(
+                signal == CaptureStats.LiveSignal.SILENCED ? "microphoneSilenced" : "microphoneRestored",
+                event
+            );
+        } catch (Exception e) {
+            android.util.Log.w("VoiceRecorder", "silence alert dropped: " + e.getMessage());
+        }
     }
 
     // Enhanced error reporting method

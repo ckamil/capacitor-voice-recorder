@@ -9,6 +9,7 @@ public class RecordOptions {
     private int silenceThreshold = CustomMediaRecorder.DEFAULT_SILENCE_THRESHOLD;
     private double minCaptureRatio = CustomMediaRecorder.DEFAULT_MIN_CAPTURE_RATIO;
     private int maxDurationMs = 0;
+    private int silenceAlertMs = CustomMediaRecorder.DEFAULT_SILENCE_ALERT_MS;
 
     public RecordOptions(String directory, String subDirectory) {
         this.directory = directory;
@@ -68,6 +69,18 @@ public class RecordOptions {
 
     public void setMaxDurationMs(int maxDurationMs) {
         this.maxDurationMs = Math.max(0, maxDurationMs);
+    }
+
+    /**
+     * A run of exact zeros this long, in ms, raises `microphoneSilenced` while the recording is
+     * still running. 0 turns the live alert off; the stop diagnostics are measured either way.
+     */
+    public int getSilenceAlertMs() {
+        return silenceAlertMs;
+    }
+
+    public void setSilenceAlertMs(int silenceAlertMs) {
+        this.silenceAlertMs = Math.max(0, silenceAlertMs);
     }
 
     public String getDirectory() {

@@ -3,6 +3,7 @@ package com.tchvu3.capacitorvoicerecorder;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 
+import android.media.AudioManager;
 import android.media.MediaRecorder;
 import org.junit.Test;
 
@@ -128,5 +129,25 @@ public class CustomMediaRecorderAudioSourceTest {
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
             CustomMediaRecorder.resolveAudioSource(options.getAudioSource(), true)
         );
+    }
+
+    @Test
+    public void audioModeNamesTellACallFromVoipFromNothing() {
+        // The first thing to read next to a silent file: a call or a VoIP session owns the mic.
+        assertEquals("normal", CustomMediaRecorder.audioModeName(AudioManager.MODE_NORMAL));
+        assertEquals("ringtone", CustomMediaRecorder.audioModeName(AudioManager.MODE_RINGTONE));
+        assertEquals("in_call", CustomMediaRecorder.audioModeName(AudioManager.MODE_IN_CALL));
+        assertEquals("in_communication", CustomMediaRecorder.audioModeName(AudioManager.MODE_IN_COMMUNICATION));
+        assertEquals("other_99", CustomMediaRecorder.audioModeName(99));
+    }
+
+    @Test
+    public void silenceAlertDefaultsOnAndCanBeTurnedOff() {
+        RecordOptions options = new RecordOptions(null, null);
+        assertEquals(CustomMediaRecorder.DEFAULT_SILENCE_ALERT_MS, options.getSilenceAlertMs());
+        options.setSilenceAlertMs(0);
+        assertEquals(0, options.getSilenceAlertMs());
+        options.setSilenceAlertMs(-5);
+        assertEquals(0, options.getSilenceAlertMs());
     }
 }
